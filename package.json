@@ -1,0 +1,306 @@
+{
+  "name": "hooshyar",
+  "displayName": "Hooshyar",
+  "description": "AI coding assistant powered by your own Anthropic-compatible /v1/messages provider (Conduit → Gemini → g4f → AIMLAPI → OpenRouter).",
+  "version": "0.3.0",
+  "publisher": "morvism",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/diyakou/HooshyarExtention.git"
+  },
+  "homepage": "https://github.com/diyakou/HooshyarExtention#readme",
+  "bugs": {
+    "url": "https://github.com/diyakou/HooshyarExtention/issues"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other", "Machine Learning"],
+  "activationEvents": [
+    "onView:hooshyar.chatView",
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "hooshyar",
+          "title": "Hooshyar",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "hooshyar": [
+        {
+          "type": "webview",
+          "id": "hooshyar.chatView",
+          "name": "Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "hooshyar.newChat",
+        "title": "Hooshyar: New Chat",
+        "icon": "$(add)"
+      },
+      {
+        "command": "hooshyar.stop",
+        "title": "Hooshyar: Stop",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "hooshyar.attachFile",
+        "title": "Hooshyar: Attach File to Chat",
+        "icon": "$(new-file)"
+      },
+      {
+        "command": "hooshyar.history",
+        "title": "Hooshyar: Chat History",
+        "icon": "$(history)"
+      },
+      {
+        "command": "hooshyar.openSettings",
+        "title": "Hooshyar: Open Settings",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "hooshyar.testConnection",
+        "title": "Hooshyar: Test Connection",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "hooshyar.undoLastWrite",
+        "title": "Hooshyar: Undo Last Write",
+        "icon": "$(discard)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "hooshyar.newChat",
+          "when": "view == hooshyar.chatView",
+          "group": "navigation"
+        },
+        {
+          "command": "hooshyar.attachFile",
+          "when": "view == hooshyar.chatView",
+          "group": "navigation"
+        },
+        {
+          "command": "hooshyar.history",
+          "when": "view == hooshyar.chatView",
+          "group": "navigation"
+        },
+        {
+          "command": "hooshyar.openSettings",
+          "when": "view == hooshyar.chatView",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Hooshyar",
+      "properties": {
+        "hooshyar.baseUrl": {
+          "type": "string",
+          "default": "https://wqai.morvism.ir/v1",
+          "description": "Base URL of your custom provider, WITHOUT /v1 or /messages (e.g. https://wqai.morvism.ir). The extension appends /v1/messages itself; if you include a trailing /v1 it will be stripped automatically."
+        },
+        "hooshyar.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key for your provider, if it requires one. Prefer setting this via the 'Hooshyar: Open Settings' command, which stores it in Secret Storage instead of settings.json."
+        },
+        "hooshyar.model": {
+          "type": "string",
+          "default": "claude-sonnet-4-6",
+          "description": "Model string to send in the 'model' field of each request. Depends on what your router accepts/maps."
+        },
+        "hooshyar.maxTokens": {
+          "type": "number",
+          "default": 4096,
+          "description": "max_tokens sent with each request."
+        },
+        "hooshyar.temperature": {
+          "type": "number",
+          "default": 1,
+          "description": "temperature sent with each request."
+        },
+        "hooshyar.enableTools": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow the assistant to read/write files and list directories in your workspace via tool_use."
+        },
+        "hooshyar.enableShellTool": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow the assistant to run terminal commands in your workspace (runs with YOUR permissions - review carefully before enabling)."
+        },
+        "hooshyar.requireApprovalForWrites": {
+          "type": "boolean",
+          "default": true,
+          "description": "Ask for confirmation before the assistant writes/edits any file or runs a shell command."
+        },
+        "hooshyar.autoIncludeActiveFile": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically attach the currently open editor file (or current selection, if any) as context on every message, without needing to ask the assistant to read it."
+        },
+        "hooshyar.maxCodebaseFiles": {
+          "type": "number",
+          "default": 400,
+          "description": "Safety cap on how many files the list_codebase / search_codebase tools will scan in one call."
+        },
+        "hooshyar.enableInlineCompletions": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable Copilot-style inline ghost text suggestions in the editor."
+        },
+        "hooshyar.inlineContextChars": {
+          "type": "number",
+          "default": 8000,
+          "description": "Maximum number of surrounding characters sent to the model for each inline completion request."
+        },
+        "hooshyar.inlineTemperature": {
+          "type": "number",
+          "default": 0.2,
+          "description": "Temperature used for inline completions. Lower values produce more deterministic suggestions."
+        },
+        "hooshyar.toolProtocol": {
+          "type": "string",
+          "enum": ["auto", "native", "text"],
+          "default": "auto",
+          "description": "How tool calls are sent to the provider. auto: native Anthropic tools when supported, otherwise flatten to text. native: always send tools array. text: never send native tools (best for gateways that only understand textual tool tags)."
+        },
+        "hooshyar.maxRetries": {
+          "type": "number",
+          "default": 2,
+          "minimum": 0,
+          "maximum": 10,
+          "description": "Number of retries for failed API requests (network/5xx)."
+        },
+        "hooshyar.requestTimeoutMs": {
+          "type": "number",
+          "default": 120000,
+          "minimum": 5000,
+          "description": "Abort API requests after this many milliseconds."
+        },
+        "hooshyar.maxContextChars": {
+          "type": "number",
+          "default": 120000,
+          "minimum": 10000,
+          "description": "Approximate character budget for chat history sent to the model (older turns are trimmed)."
+        },
+        "hooshyar.maxFileSizeBytes": {
+          "type": "number",
+          "default": 524288,
+          "description": "Maximum file size (bytes) read_file / search_codebase will load."
+        },
+        "hooshyar.maxWriteSizeBytes": {
+          "type": "number",
+          "default": 1048576,
+          "description": "Maximum file size (bytes) write_file will accept."
+        },
+        "hooshyar.respectIgnoreFiles": {
+          "type": "boolean",
+          "default": true,
+          "description": "Skip files matched by .gitignore / .cursorignore when listing or searching the codebase."
+        },
+        "hooshyar.showDiffBeforeWrite": {
+          "type": "boolean",
+          "default": true,
+          "description": "Open a diff view of proposed file changes before asking for write approval."
+        },
+        "hooshyar.debugLogging": {
+          "type": "boolean",
+          "default": false,
+          "description": "Write verbose debug logs to the Hooshyar output channel."
+        },
+        "hooshyar.extraHeaders": {
+          "type": "string",
+          "default": "{}",
+          "description": "Extra HTTP headers as JSON object, e.g. {\"X-Custom-Header\":\"value\"}."
+        },
+        "hooshyar.allowedShellCommands": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["npm", "pnpm", "yarn", "node", "python", "pytest", "git", "cargo", "go", "make"],
+          "description": "When run_command is enabled, only commands whose executable name is in this list are allowed (unless the full command matches an entry)."
+        },
+        "hooshyar.useRipgrep": {
+          "type": "boolean",
+          "default": true,
+          "description": "Use ripgrep (rg) for search_codebase when available."
+        },
+        "hooshyar.workspaceIndexMaxFiles": {
+          "type": "number",
+          "default": 2000,
+          "description": "Max files indexed for @-mention autocomplete."
+        },
+        "hooshyar.rulesPaths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Extra rule files relative to workspace root (also loads .cursorrules, .cursor/rules/*.md, .hooshyar/rules.md)."
+        },
+        "hooshyar.includeGitDiff": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include git diff summary in message context."
+        },
+        "hooshyar.includeSymbolOutline": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include active file symbol outline in message context."
+        },
+        "hooshyar.inlineModel": {
+          "type": "string",
+          "default": "",
+          "description": "Optional separate model for inline completions (defaults to hooshyar.model)."
+        },
+        "hooshyar.inlineMaxTokens": {
+          "type": "number",
+          "default": 512,
+          "description": "max_tokens for inline completion requests."
+        },
+        "hooshyar.inlineDebounceMs": {
+          "type": "number",
+          "default": 400,
+          "minimum": 0,
+          "description": "Debounce delay before requesting inline completions."
+        },
+        "hooshyar.inlineSkipComments": {
+          "type": "boolean",
+          "default": true,
+          "description": "Skip inline completions inside comments or strings."
+        },
+        "hooshyar.maxImageSizeBytes": {
+          "type": "number",
+          "default": 4194304,
+          "description": "Maximum image attachment size in bytes (PNG/JPEG/GIF/WebP)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "npm run compile && node --test test/*.test.mjs",
+    "lint": "eslint src --ext .ts",
+    "package": "vsce package --allow-missing-repository"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^7.18.0",
+    "@typescript-eslint/parser": "^7.18.0",
+    "eslint": "^8.57.0",
+    "typescript": "^5.4.0",
+    "@vscode/vsce": "^2.24.0"
+  }
+}
