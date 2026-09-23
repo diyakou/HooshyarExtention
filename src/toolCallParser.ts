@@ -16,6 +16,9 @@ export function extractTextualToolCalls(
 
   const parsed: ParsedToolCall[] = [];
 
+  // Unwrap any markdown code blocks enclosing tool calls or write_file tags
+  text = text.replace(/```(?:xml|html|json|tool_call)?\s*(<(?:tool_call|write_file|search_replace)[\s\S]*?<\/(?:tool_call|write_file|search_replace)>)\s*```/g, "$1");
+
   text = text.replace(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g, (_all, body: string) => {
     const call = parseJsonToolCall(body);
     if (call) parsed.push(call);
@@ -40,6 +43,26 @@ export function extractTextualToolCalls(
     });
   }
 
+  const diffBlockRe = /<{7}\s*SEARCH[\r\n]+([\s\S]*?)={7}[\r\n]+([\s\S]*?)>{7}\s*REPLACE/g;
+  let diffMatch: RegExpExecArray | null;
+  while ((diffMatch = diffBlockRe.exec(text)) !== null) {
+    const oldString = diffMatch[1].replace(/\r\n/g, "\n");
+    const newString = diffMatch[2].replace(/\r\n/g, "\n");
+    const textBefore = text.slice(0, diffMatch.index);
+    const pathCandidate = inferFilePath(textBefore, textBefore) || inferFilePath(text, text);
+    if (pathCandidate && oldString.trim()) {
+      parsed.push({
+        name: "search_replace",
+        input: {
+          path: pathCandidate,
+          old_string: oldString,
+          new_string: newString
+        }
+      });
+    }
+  }
+  text = text.replace(diffBlockRe, "");
+
   const toolCalls: ToolUseBlock[] = parsed.map((c, i) => ({
     type: "tool_use",
     id: `text_tool_${i + 1}_${Date.now()}`,
@@ -52,40 +75,196 @@ export function extractTextualToolCalls(
 
 export function parseJsonToolCall(body: string): ParsedToolCall | null {
   const cleaned = body.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
-  try {
-    const obj = JSON.parse(cleaned);
-    if (obj && typeof obj === "object" && typeof obj.name === "string") {
-      const input =
-        obj.input && typeof obj.input === "object" && !Array.isArray(obj.input)
-          ? (obj.input as Record<string, unknown>)
-          : obj.parameters && typeof obj.parameters === "object" && !Array.isArray(obj.parameters)
-          ? (obj.parameters as Record<string, unknown>)
-          : {};
-      return { name: obj.name, input };
-    }
-  } catch {
-    const nameMatch = cleaned.match(/"name"\s*:\s*"([^"]+)"/);
-    if (nameMatch) {
-      const name = nameMatch[1];
-      const input: Record<string, unknown> = {};
-      const pathMatch = cleaned.match(/"path"\s*:\s*"([^"]*)"/);
-      if (pathMatch) input.path = pathMatch[1];
-      const patternMatch = cleaned.match(/"pattern"\s*:\s*"([^"]*)"/);
-      if (patternMatch) input.pattern = patternMatch[1];
-      const cmdMatch = cleaned.match(/"command"\s*:\s*"([\s\S]*?)"\s*}/);
-      if (cmdMatch) input.command = cmdMatch[1];
-      const contentMatch = cleaned.match(/"content"\s*:\s*"([\s\S]*)"\s*}?\s*}?\s*$/);
-      if (contentMatch) {
-        input.content = contentMatch[1]
-          .replace(/\\n/g, "\n")
-          .replace(/\\t/g, "\t")
-          .replace(/\\"/g, '"')
-          .replace(/\\\\/g, "\\");
-      }
-      return { name, input };
-    }
+  const parsed = safeParseJsonToolInput(cleaned);
+  if (parsed && typeof parsed.name === "string") {
+    const name = parsed.name;
+    const input =
+      parsed.input && typeof parsed.input === "object" && !Array.isArray(parsed.input)
+        ? (parsed.input as Record<string, unknown>)
+        : parsed.parameters && typeof parsed.parameters === "object" && !Array.isArray(parsed.parameters)
+        ? (parsed.parameters as Record<string, unknown>)
+        : parsed;
+    return { name, input };
   }
   return null;
+}
+
+/**
+ * Robust JSON parser for tool call inputs streamed or formatted by LLMs.
+ * Handles unescaped control characters (newlines/tabs inside strings),
+ * truncated streaming outputs, and falls back to regex property extraction.
+ */
+export function safeParseJsonToolInput(raw: string): Record<string, unknown> {
+  const trimmed = (raw || "").trim();
+  if (!trimmed) return {};
+
+  // 1. Direct JSON.parse
+  try {
+    const res = JSON.parse(trimmed);
+    if (res && typeof res === "object" && !Array.isArray(res)) {
+      return res as Record<string, unknown>;
+    }
+  } catch {
+    // Continue to resilient repairs
+  }
+
+  // 2. Escape raw unescaped control characters (literal newlines, tabs, etc.) inside string literals
+  try {
+    const sanitized = sanitizeJsonControlChars(trimmed);
+    const res = JSON.parse(sanitized);
+    if (res && typeof res === "object" && !Array.isArray(res)) {
+      return res as Record<string, unknown>;
+    }
+  } catch {
+    // Continue to repair truncation
+  }
+
+  // 3. Repair truncated JSON (e.g. streaming cutoff before closing quote or brace)
+  try {
+    const repaired = repairTruncatedJson(trimmed);
+    const res = JSON.parse(repaired);
+    if (res && typeof res === "object" && !Array.isArray(res)) {
+      return res as Record<string, unknown>;
+    }
+  } catch {
+    // Continue to regex fallback
+  }
+
+  // 4. Regex property extraction fallback
+  return extractPropertiesWithRegex(trimmed);
+}
+
+function sanitizeJsonControlChars(str: string): string {
+  let result = "";
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < str.length; i++) {
+    const char = str[i];
+    const code = str.charCodeAt(i);
+
+    if (inString) {
+      if (escaped) {
+        result += char;
+        escaped = false;
+      } else if (char === "\\") {
+        result += char;
+        escaped = true;
+      } else if (char === '"') {
+        result += char;
+        inString = false;
+      } else if (char === "\n") {
+        result += "\\n";
+      } else if (char === "\r") {
+        result += "\\r";
+      } else if (char === "\t") {
+        result += "\\t";
+      } else if (code < 32) {
+        result += "\\u" + code.toString(16).padStart(4, "0");
+      } else {
+        result += char;
+      }
+    } else {
+      result += char;
+      if (char === '"') {
+        inString = true;
+      }
+    }
+  }
+  return result;
+}
+
+function repairTruncatedJson(str: string): string {
+  const sanitized = sanitizeJsonControlChars(str);
+  let inString = false;
+  let escaped = false;
+  const stack: string[] = [];
+
+  for (let i = 0; i < sanitized.length; i++) {
+    const char = sanitized[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+    } else {
+      if (char === '"') {
+        inString = true;
+      } else if (char === "{" || char === "[") {
+        stack.push(char);
+      } else if (char === "}" && stack.length > 0 && stack[stack.length - 1] === "{") {
+        stack.pop();
+      } else if (char === "]" && stack.length > 0 && stack[stack.length - 1] === "[") {
+        stack.pop();
+      }
+    }
+  }
+
+  let repaired = sanitized;
+  if (inString) {
+    repaired += '"';
+  }
+  while (stack.length > 0) {
+    const open = stack.pop();
+    repaired += open === "{" ? "}" : "]";
+  }
+  return repaired;
+}
+
+function extractPropertiesWithRegex(raw: string): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+
+  const nameMatch = raw.match(/"(?:name|tool|tool_name)"\s*:\s*"([^"]+)"/i);
+  if (nameMatch) out.name = nameMatch[1].trim();
+
+  const pathMatch = raw.match(
+    /"(?:path|file_path|filePath|file|filename|fileName|target_file|targetFile|target|dir|directory|folder)"\s*:\s*"([^"]+)"/i
+  );
+  if (pathMatch) out.path = pathMatch[1].trim();
+
+  const patternMatch = raw.match(/"(?:pattern|query|search|needle|regex)"\s*:\s*"([^"]+)"/i);
+  if (patternMatch) out.pattern = patternMatch[1];
+
+  const cmdMatch = raw.match(/"(?:command|cmd|exec)"\s*:\s*"([\s\S]*?)"(?:\s*,|\s*})/i);
+  if (cmdMatch) out.command = unescapeJsonString(cmdMatch[1]);
+
+  const oldMatch = raw.match(
+    /"(?:old_string|oldString|old_text|oldText|search|find|original|target_string)"\s*:\s*"([\s\S]*?)"(?:\s*,|\s*"(?:new_string|newString|new_text|path|file|replace))/i
+  );
+  if (oldMatch) out.old_string = unescapeJsonString(oldMatch[1]);
+
+  const newMatch = raw.match(
+    /"(?:new_string|newString|new_text|newText|replace|replacement|replacement_content)"\s*:\s*"([\s\S]*?)"(?:\s*,|\s*"(?:old_string|path|file|replace_all)|\s*})/i
+  );
+  if (newMatch) out.new_string = unescapeJsonString(newMatch[1]);
+
+  const replaceAllMatch = raw.match(/"(?:replace_all|replaceAll)"\s*:\s*(true|false)/i);
+  if (replaceAllMatch) out.replace_all = replaceAllMatch[1].toLowerCase() === "true";
+
+  // Match content across multiple formats (standard, or trailing to end of payload)
+  const contentMatch =
+    raw.match(/"(?:content|text|file_content|fileContent|code|body)"\s*:\s*"([\s\S]*?)"(?:\s*,|\s*})/i) ||
+    raw.match(/"(?:content|text|file_content|fileContent|code|body)"\s*:\s*"([\s\S]*)/i);
+  if (contentMatch) {
+    let c = contentMatch[1];
+    // If matched trailing, strip closing quotation or braces if present
+    c = c.replace(/"\s*}?\s*}?\s*$/, "");
+    out.content = unescapeJsonString(c);
+  }
+
+  return out;
+}
+
+function unescapeJsonString(val: string): string {
+  return val
+    .replace(/\\n/g, "\n")
+    .replace(/\\r/g, "\r")
+    .replace(/\\t/g, "\t")
+    .replace(/\\"/g, '"')
+    .replace(/\\\\/g, "\\");
 }
 
 export function parseParams(raw: string): Record<string, unknown> {
@@ -108,8 +287,8 @@ export function parseParams(raw: string): Record<string, unknown> {
   let m: RegExpExecArray | null;
   while ((m = tagRe.exec(trimmed)) !== null) {
     const key = m[1];
-    if (key === "content") {
-      out[key] = m[2].replace(/^\n/, "").replace(/\n$/, "");
+    if (key === "content" || key === "old_string" || key === "new_string") {
+      out[key] = m[2].replace(/^\r?\n/, "").replace(/\r?\n$/, "");
     } else {
       out[key] = coerceScalar(m[2].trim());
     }
@@ -129,7 +308,9 @@ function escapeRegExp(str: string): string {
 }
 
 export function extractProposedFileWrites(blocks: ContentBlock[], userText: string): ToolUseBlock[] {
-  if (!userWantsFileWrite(userText)) return [];
+  // If the user asked for an edit/fix on an existing file, NEVER convert a code snippet into a destructive write_file!
+  if (userWantsFileEdit(userText)) return [];
+  if (!userWantsNewFile(userText)) return [];
 
   const text = blocks
     .filter((b): b is { type: "text"; text: string } => b.type === "text")
@@ -153,33 +334,84 @@ export function extractProposedFileWrites(blocks: ContentBlock[], userText: stri
   ];
 }
 
-export function userWantsFileWrite(userText: string): boolean {
+export function userWantsFileEdit(userText: string): boolean {
   return (
-    /(?:create|make|add|write|build|generate|edit|update|بساز|ایجاد|بنویس|ساخت|اضافه|ویرایش)/i.test(userText) ||
-    /(?:readme|\.(?:md|txt|ts|tsx|js|jsx|py|json|css|html|yml|yaml)|file|فایل)/i.test(userText)
+    /(?:edit|update|patch|fix|modify|change|refactor|replace|add|insert|remove|delete|ویرایش|ادیت|تغییر|عوض|اصلاح|درست\s*کن|رفع\s*باگ|بهینه‌سازی|بهینه\s*سازی|جایگزین|ریپلیس|آپدیت|اضافه|حذف|پاک)/i.test(
+      userText
+    ) &&
+    !/(?:rewrite\s+completely|from\s+scratch|کامل\s*بازنویسی|از\s*نو|از\s*اول|بازنویسی\s*کامل)/i.test(userText)
   );
 }
 
-function inferFilePath(userText: string, assistantText: string): string | null {
+export function userWantsNewFile(userText: string): boolean {
+  const isInvestigatoryOnly =
+    /^(?:بررسی|توضیح|چرا|چطور|چگونه|تحلیل|آیا|ببین|بگو|explain|check|review|why|how|what|is\s+there)\b/i.test(
+      userText.trim()
+    ) && !/(?:بساز|بنویس|ایجاد|create|write|make|generate)\b/i.test(userText);
+
+  if (isInvestigatoryOnly) return false;
+
+  const hasCreateVerb =
+    /(?:create|make|write\s+a\s+new|generate|build|new\s+file|rewrite\s+completely|from\s+scratch|بساز|ایجاد|بنویس|ساخت|فایل\s*جدید|کامل\s*بازنویسی|از\s*نو|از\s*اول)/i.test(
+      userText
+    );
+
+  const hasExplicitTarget =
+    /(?:readme|\.(?:md|txt|ts|tsx|js|jsx|py|json|css|html|yml|yaml|toml|sql|sh|bat)|file\b|فایل)/i.test(
+      userText
+    );
+
+  return hasCreateVerb && hasExplicitTarget && !userWantsFileEdit(userText);
+}
+
+export function userWantsFileWrite(userText: string): boolean {
+  return userWantsNewFile(userText);
+}
+
+export function inferFilePath(userText: string, assistantText: string): string | null {
   const fromUser = userText.match(
-    /(?:^|[\s"'`(])([\w./-]+\.(?:md|txt|ts|tsx|js|jsx|py|json|css|html|yml|yaml|toml|xml|csv|sh|bat|ps1))(?:[\s"'`)]|$)/i
+    /(?:^|[\s"'`(\[])([\w./\\-]+\.(?:md|txt|ts|tsx|js|jsx|py|json|css|html|yml|yaml|toml|xml|csv|sh|bat|ps1|sql))(?:[\s"'`)\]]|$)/i
   );
   if (fromUser) return normalizeRelPath(fromUser[1]);
-  if (/readme/i.test(userText)) return "README.md";
 
-  const fromAssistantFa = assistantText.match(/فایل\s+([\w./-]+\.\w+)/i);
+  const fromFaName = userText.match(
+    /(?:فایل|file|نام|به\s*نام)\s*[`"']?([\w./\\-]+\.(?:md|txt|ts|tsx|js|jsx|py|json|css|html|yml|yaml|toml|xml|csv|sh|bat|ps1|sql))[`"']?/i
+  );
+  if (fromFaName) return normalizeRelPath(fromFaName[1]);
+
+  const fromComment = assistantText.match(
+    /(?:\/\/|#|\/\*|<!--)\s*(?:file(?:name|path)?|path):\s*([\w./\\-]+\.\w+)/i
+  );
+  if (fromComment) return normalizeRelPath(fromComment[1]);
+
+  const fromSimpleComment = assistantText.match(
+    /(?:\/\/|#|\/\*|<!--)\s*([\w./\\-]+\.(?:md|txt|ts|tsx|js|jsx|py|json|css|html|yml|yaml|toml|xml|csv|sh|bat|ps1|sql))\s*(?:-->|\*\/|\r?\n|$)/i
+  );
+  if (fromSimpleComment) return normalizeRelPath(fromSimpleComment[1]);
+
+  const fromBackticks = assistantText.match(
+    /`([\w./\\-]+\.(?:md|txt|ts|tsx|js|jsx|py|json|css|html|yml|yaml|toml|sql|sh))`(?:\s*(?:فایل|file|را|رو))?/i
+  );
+  if (fromBackticks) return normalizeRelPath(fromBackticks[1]);
+
+  const fromAssistantFa = assistantText.match(/فایل\s*[`"']?([\w./\\-]+\.\w+)[`"']?/i);
   if (fromAssistantFa) return normalizeRelPath(fromAssistantFa[1]);
-  if (/(?:README|readme)(?:\.md)?/i.test(assistantText)) return "README.md";
+
+  if (/(?:README|readme)(?:\.md)?/i.test(userText) || /(?:README|readme)(?:\.md)?/i.test(assistantText)) {
+    return "README.md";
+  }
 
   const fromAssistantFile = assistantText.match(
-    /(?:^|[\s"'`])([\w./-]+\.(?:md|txt|ts|tsx|js|jsx|py|json))(?:[\s"'`]|$)/m
+    /(?:^|[\s"'`])([\w./\\-]+\.(?:md|txt|ts|tsx|js|jsx|py|json|css|html|yml|yaml|toml|sql))(?:[\s"'`]|$)/m
   );
   if (fromAssistantFile) return normalizeRelPath(fromAssistantFile[1]);
   return null;
 }
 
-function normalizeRelPath(p: string): string {
-  return p.replace(/\\/g, "/").replace(/^\.\//, "").trim();
+export function normalizeRelPath(p: string): string {
+  const norm = p.replace(/\\/g, "/").replace(/^\.\//, "").trim();
+  if (norm === "undefined" || norm === "null") return "";
+  return norm;
 }
 
 export function truncateToolOutput(output: string, max = 14_000): string {
@@ -246,20 +478,15 @@ function extractFileContentFromAssistant(text: string, _filePath: string): strin
   const enHeader = body.match(/(?:suggested|proposed)\s+(?:content|file|readme)[^:\n]*:\s*\n?([\s\S]*)/i);
   if (enHeader) body = enHeader[1];
 
-  const fenced = body.match(/```(?:markdown|md|text)?\s*\n([\s\S]*?)```/);
-  if (fenced && fenced[1].trim().length >= 20) return fenced[1].trim();
+  // Match any fenced code block (python, js, ts, html, css, json, md, etc.)
+  const fenced = body.match(/```[\w-]*\s*\n([\s\S]*?)```/);
+  if (fenced && fenced[1].trim().length >= 5) {
+    let code = fenced[1].trim();
+    code = code.replace(/^(?:\/\/|#)\s*(?:file(?:name|path)?|path):[^\n]*\n+/i, "");
+    return code;
+  }
 
-  const headingStart = body.search(/^#{1,6}\s+\S/m);
-  if (headingStart >= 0) body = body.slice(headingStart);
-
-  body = body.replace(
-    /\n(?:---+\n)?(?:Would you like|Do you want|Shall I|Let me know|If you(?:'d| would)|آیا)[\s\S]*$/i,
-    ""
-  );
-
-  body = body.trim();
-  if (body.length < 20) return null;
-  return body;
+  return null;
 }
 
 export function genId(): string {

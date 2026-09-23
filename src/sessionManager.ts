@@ -30,7 +30,7 @@ export class SessionManager {
   }
 
   metas(): ChatSessionMeta[] {
-    return this.getSessions().map((s) => ({ id: s.id, title: s.title, updatedAt: s.updatedAt }));
+    return this.getSessions().map((s) => ({ id: s.id, title: s.title, updatedAt: s.updatedAt, mode: s.mode }));
   }
 
   find(id: string): ChatSession | undefined {
@@ -81,7 +81,8 @@ export class SessionManager {
     sessionId: string,
     history: Message[],
     taskList: ChatSession["taskList"],
-    usage: ChatSession["usage"]
+    usage: ChatSession["usage"],
+    mode?: ChatSession["mode"]
   ): Thenable<void> {
     if (history.length === 0) return Promise.resolve();
 
@@ -95,7 +96,8 @@ export class SessionManager {
       updatedAt: now,
       history: this.compressHistory(history),
       taskList,
-      usage
+      usage,
+      mode: mode ?? (idx >= 0 ? sessions[idx].mode : "agent")
     };
     if (idx >= 0) sessions.splice(idx, 1);
     sessions.unshift(session);

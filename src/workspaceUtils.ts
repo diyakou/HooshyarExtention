@@ -5,15 +5,95 @@ export const DEFAULT_EXCLUDE_GLOB =
   "**/{node_modules,out,dist,build,.git,.venv,venv,__pycache__,.next,.turbo,coverage}/**";
 
 export function getWorkspaceFolders(): readonly vscode.WorkspaceFolder[] {
-  return vscode.workspace.workspaceFolders ?? [];
+  const folders = vscode.workspace.workspaceFolders;
+  if (folders && folders.length > 0) return folders;
+
+  // VS Code also lets users open individual files without opening a folder/workspace.
+  // Treat the active local file's containing directory as a single-folder workspace so
+  // read/edit/search tools can still operate on the file the user has open.
+  const activeUri = vscode.window.activeTextEditor?.document.uri;
+  if (activeUri?.scheme === "file") {
+    const root = path.dirname(activeUri.fsPath);
+    return [
+      {
+        uri: vscode.Uri.file(root),
+        name: path.basename(root),
+        index: 0
+      } as vscode.WorkspaceFolder
+    ];
+  }
+
+  return [];
 }
 
-export function requireWorkspaceFolder(): vscode.WorkspaceFolder {
+export interface EnvironmentPlatformInfo {
+  os: string;
+  platform: string;
+  shell: string;
+  shellPath: string;
+  isWindows: boolean;
+}
+
+export function getEnvironmentPlatformInfo(): EnvironmentPlatformInfo {
+  const isWindows = process.platform === "win32";
+  const os = isWindows ? "Windows" : process.platform === "darwin" ? "macOS" : "Linux";
+  const shellPath =
+    (typeof vscode !== "undefined" && vscode.env?.shell) ||
+    (isWindows ? process.env.ComSpec || "powershell.exe" : process.env.SHELL || "/bin/bash");
+  const shell = path.basename(shellPath).replace(/\.exe$/i, "").toLowerCase();
+  return {
+    os,
+    platform: process.platform,
+    shell,
+    shellPath,
+    isWindows
+  };
+}
+
+export function getTargetWorkspaceFolder(targetPath?: string): vscode.WorkspaceFolder {
   const folders = getWorkspaceFolders();
   if (folders.length === 0) {
     throw new Error("No workspace folder is open.");
   }
-  return folders[0];
+  if (!targetPath || folders.length === 1) {
+    const active = vscode.window.activeTextEditor;
+    if (active) {
+      const found = folders.find((f) => isSubpath(f.uri.fsPath, active.document.uri.fsPath));
+      if (found) return found;
+    }
+    return folders[0];
+  }
+  const trimmed = targetPath.trim().replace(/\\/g, "/").replace(/^[\\/]+/, "");
+  const firstSegment = trimmed.split("/")[0].toLowerCase();
+  const matched = folders.find(
+    (f) => f.name.toLowerCase() === firstSegment || isSubpath(f.uri.fsPath, targetPath)
+  );
+  return matched || folders[0];
+}
+
+export function requireWorkspaceFolder(targetPath?: string): vscode.WorkspaceFolder {
+  return getTargetWorkspaceFolder(targetPath);
+}
+
+export function normalizeFsPath(filePath: string): string {
+  let cleaned = filePath.trim().replace(/\\/g, "/");
+  if (process.platform === "win32") {
+    if (/^\/[a-zA-Z]:/.test(cleaned)) {
+      cleaned = cleaned.slice(1);
+    }
+  }
+  return path.normalize(cleaned);
+}
+
+export function isSubpath(parent: string, child: string): boolean {
+  const normParent = normalizeFsPath(parent);
+  const normChild = normalizeFsPath(child);
+  if (process.platform === "win32") {
+    const pLower = normParent.toLowerCase();
+    const cLower = normChild.toLowerCase();
+    return cLower === pLower || cLower.startsWith(pLower.endsWith(path.sep) ? pLower : pLower + path.sep);
+  }
+  return normChild === normParent || normChild.startsWith(normParent.endsWith(path.sep) ? normParent : normParent + path.sep);
 }
 
 /** Resolve a workspace-relative or absolute path to a URI inside an open workspace folder. */
@@ -24,14 +104,16 @@ export function resolveWorkspaceUri(inputPath: string): { uri: vscode.Uri; relPa
     throw new Error("No workspace folder is open.");
   }
 
-  if (path.isAbsolute(trimmed)) {
-    const normalized = path.normalize(trimmed);
+  const isAbs = path.isAbsolute(trimmed) || (process.platform === "win32" && /^[a-zA-Z]:/i.test(trimmed)) || /^\/[a-zA-Z]:/i.test(trimmed);
+  if (isAbs) {
+    const normalized = normalizeFsPath(trimmed);
     for (const folder of folders) {
-      const root = path.normalize(folder.uri.fsPath);
-      if (normalized === root || normalized.startsWith(root + path.sep)) {
+      if (isSubpath(folder.uri.fsPath, normalized)) {
+        const root = normalizeFsPath(folder.uri.fsPath);
         const rel = path.relative(root, normalized).split(path.sep).join("/");
         assertSafeRelativePath(rel);
-        return { uri: vscode.Uri.file(normalized), relPath: rel, folder };
+        const relLabel = folders.length > 1 ? `${folder.name}/${rel}` : rel;
+        return { uri: vscode.Uri.file(normalized), relPath: relLabel, folder };
       }
     }
     throw new Error("Path is outside all open workspace folders.");
@@ -41,34 +123,60 @@ export function resolveWorkspaceUri(inputPath: string): { uri: vscode.Uri; relPa
   assertSafeRelativePath(rel);
 
   if (folders.length === 1) {
-    const root = folders[0].uri.fsPath;
+    const root = normalizeFsPath(folders[0].uri.fsPath);
     const resolved = path.normalize(path.join(root, rel));
-    if (!resolved.startsWith(path.normalize(root))) {
+    if (!isSubpath(root, resolved)) {
       throw new Error("Refusing to access a path outside the workspace.");
     }
     return { uri: vscode.Uri.file(resolved), relPath: rel, folder: folders[0] };
   }
 
+  // Multi-folder workspace: check if rel is "." or empty
+  if (!rel || rel === ".") {
+    const active = vscode.window.activeTextEditor;
+    const preferred =
+      active && folders.find((f) => isSubpath(f.uri.fsPath, active.document.uri.fsPath))
+        ? folders.find((f) => isSubpath(f.uri.fsPath, active.document.uri.fsPath))!
+        : folders[0];
+    return { uri: preferred.uri, relPath: preferred.name, folder: preferred };
+  }
+
   const firstSegment = rel.split("/")[0];
-  const matched = folders.find((f) => f.name === firstSegment);
-  if (matched && rel.includes("/")) {
-    const rest = rel.slice(firstSegment.length + 1);
-    const resolved = path.normalize(path.join(matched.uri.fsPath, rest));
-    assertSafeRelativePath(rest);
-    return { uri: vscode.Uri.file(resolved), relPath: `${matched.name}/${rest}`, folder: matched };
+  const matched = folders.find((f) => f.name.toLowerCase() === firstSegment.toLowerCase());
+  if (matched) {
+    if (rel.includes("/")) {
+      const rest = rel.slice(firstSegment.length + 1);
+      assertSafeRelativePath(rest);
+      const resolved = path.normalize(path.join(matched.uri.fsPath, rest));
+      if (!isSubpath(matched.uri.fsPath, resolved)) {
+        throw new Error("Refusing to access a path outside the workspace.");
+      }
+      return { uri: vscode.Uri.file(resolved), relPath: `${matched.name}/${rest}`, folder: matched };
+    } else {
+      return { uri: matched.uri, relPath: matched.name, folder: matched };
+    }
   }
 
   const active = vscode.window.activeTextEditor;
   const preferred =
-    active && folders.find((f) => active.document.uri.fsPath.startsWith(f.uri.fsPath))
-      ? folders.find((f) => active.document.uri.fsPath.startsWith(f.uri.fsPath))!
+    active && folders.find((f) => isSubpath(f.uri.fsPath, active.document.uri.fsPath))
+      ? folders.find((f) => isSubpath(f.uri.fsPath, active.document.uri.fsPath))!
       : folders[0];
 
   const resolved = path.normalize(path.join(preferred.uri.fsPath, rel));
-  if (!resolved.startsWith(path.normalize(preferred.uri.fsPath))) {
-    throw new Error("Refusing to access a path outside the workspace.");
+  if (isSubpath(preferred.uri.fsPath, resolved)) {
+    return { uri: vscode.Uri.file(resolved), relPath: `${preferred.name}/${rel}`, folder: preferred };
   }
-  return { uri: vscode.Uri.file(resolved), relPath: rel, folder: preferred };
+
+  for (const folder of folders) {
+    if (folder === preferred) continue;
+    const r = path.normalize(path.join(folder.uri.fsPath, rel));
+    if (isSubpath(folder.uri.fsPath, r)) {
+      return { uri: vscode.Uri.file(r), relPath: `${folder.name}/${rel}`, folder };
+    }
+  }
+
+  throw new Error("Refusing to access a path outside the workspace.");
 }
 
 function assertSafeRelativePath(rel: string): void {
@@ -87,19 +195,20 @@ export function normalizeWorkspaceRelativePath(inputPath?: string): string | und
   const folders = getWorkspaceFolders();
   if (folders.length === 0) return undefined;
 
-  const normalized = path.normalize(trimmed.replace(/\\/g, "/"));
-  if (path.isAbsolute(normalized)) {
+  const isAbs = path.isAbsolute(trimmed) || (process.platform === "win32" && /^[a-zA-Z]:/i.test(trimmed)) || /^\/[a-zA-Z]:/i.test(trimmed);
+  if (isAbs) {
+    const normalized = normalizeFsPath(trimmed);
     for (const folder of folders) {
-      const root = path.normalize(folder.uri.fsPath);
-      if (normalized.startsWith(root)) {
-        const rel = path.relative(root, normalized).replace(/^[\\/]+/, "");
+      if (isSubpath(folder.uri.fsPath, normalized)) {
+        const root = normalizeFsPath(folder.uri.fsPath);
+        const rel = path.relative(root, normalized).split(path.sep).join("/").replace(/^[\\/]+/, "");
         return rel.length === 0 || rel === "." ? undefined : rel;
       }
     }
     throw new Error("Path is outside the current workspace.");
   }
 
-  const rel = normalized.replace(/^[\\/]+/, "");
+  const rel = trimmed.replace(/\\/g, "/").replace(/^[\\/]+/, "");
   assertSafeRelativePath(rel);
   return rel.length === 0 || rel === "." ? undefined : rel;
 }

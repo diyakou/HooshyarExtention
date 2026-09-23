@@ -14,11 +14,14 @@ async function readIfExists(filePath: string): Promise<string | null> {
   }
 }
 
-async function collectRuleFiles(workspaceRoot: string, extraPaths: string[]): Promise<string[]> {
+export async function collectRuleFiles(workspaceRoot: string, extraPaths: string[] = []): Promise<string[]> {
   const candidates = [
     path.join(workspaceRoot, ".cursorrules"),
     path.join(workspaceRoot, ".hooshyar", "rules.md"),
     path.join(workspaceRoot, ".hooshyarrules"),
+    path.join(workspaceRoot, ".github", "copilot-instructions.md"),
+    path.join(workspaceRoot, "AGENTS.md"),
+    path.join(workspaceRoot, "CLAUDE.md"),
     ...extraPaths.map((p) => (path.isAbsolute(p) ? p : path.join(workspaceRoot, p)))
   ];
 

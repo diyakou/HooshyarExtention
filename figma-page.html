@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Untitled</title>
+  <style>
+    :root {
+      --figma-gray: #d9d9d9;
+      --page-background: #ffffff;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      min-height: 100%;
+      margin: 0;
+    }
+
+    body {
+      background: var(--page-background);
+      font-family: Arial, sans-serif;
+    }
+
+    /* Figma Page 1: two unstyled rectangles, rendered at their original dimensions. */
+    .figma-canvas {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-start;
+      gap: 24px;
+      min-height: 100vh;
+      padding: 24px;
+    }
+
+    .rectangle {
+      flex: 0 0 auto;
+      background: var(--figma-gray);
+    }
+
+    .rectangle--small {
+      width: 156px;
+      height: 135px;
+    }
+
+    .rectangle--large {
+      width: 267px;
+      height: 296px;
+    }
+  </style>
+</head>
+<body>
+  <main class="figma-canvas" aria-label="Figma design">
+    <div class="rectangle rectangle--small" aria-label="مستطیل ۱۵۶ در ۱۳۵ پیکسل"></div>
+    <div class="rectangle rectangle--large" aria-label="مستطیل ۲۶۷ در ۲۹۶ پیکسل"></div>
+  </main>
+</body>
+</html>

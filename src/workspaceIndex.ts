@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
-import { DEFAULT_EXCLUDE_GLOB } from "./workspaceUtils";
+import * as path from "path";
+import { DEFAULT_EXCLUDE_GLOB, isSubpath, normalizeFsPath } from "./workspaceUtils";
 
 export interface IndexedFile {
   path: string;
@@ -28,11 +29,11 @@ export async function getWorkspaceFileIndex(force = false): Promise<IndexedFile[
 
   for (const uri of uris) {
     for (const folder of folders) {
-      const root = folder.uri.fsPath;
-      if (!uri.fsPath.startsWith(root)) continue;
-      const rel = uri.fsPath.slice(root.length + 1).split("\\").join("/");
-      const path = folders.length > 1 ? `${folder.name}/${rel}` : rel;
-      files.push({ path, label: path });
+      if (!isSubpath(folder.uri.fsPath, uri.fsPath)) continue;
+      const root = normalizeFsPath(folder.uri.fsPath);
+      const rel = path.relative(root, normalizeFsPath(uri.fsPath)).split(path.sep).join("/");
+      const p = folders.length > 1 ? `${folder.name}/${rel}` : rel;
+      files.push({ path: p, label: p });
       break;
     }
   }

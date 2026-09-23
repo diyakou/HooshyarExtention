@@ -1,9 +1,9 @@
 {
-  "name": "hooshyar",
-  "displayName": "Hooshyar",
-  "description": "AI coding assistant powered by your own Anthropic-compatible /v1/messages provider (Conduit → Gemini → g4f → AIMLAPI → OpenRouter).",
-  "version": "0.3.0",
-  "publisher": "morvism",
+  "name": "houshiar",
+  "displayName": "houshiar",
+  "description": "AI coding assistant powered by your own Anthropic-compatible /v1/messages provider (Houshiar v1).",
+  "version": "0.6.1",
+  "publisher": "WebDops",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -16,7 +16,10 @@
   "engines": {
     "vscode": "^1.85.0"
   },
-  "categories": ["Other", "Machine Learning"],
+  "categories": [
+    "Other",
+    "Machine Learning"
+  ],
   "activationEvents": [
     "onView:hooshyar.chatView",
     "onStartupFinished"
@@ -58,6 +61,16 @@
         "icon": "$(new-file)"
       },
       {
+        "command": "hooshyar.attachActiveFile",
+        "title": "Hooshyar: Attach Active File",
+        "icon": "$(file)"
+      },
+      {
+        "command": "hooshyar.addFileToChat",
+        "title": "Hooshyar: Add to Chat",
+        "icon": "$(comment-discussion)"
+      },
+      {
         "command": "hooshyar.history",
         "title": "Hooshyar: Chat History",
         "icon": "$(history)"
@@ -76,39 +89,175 @@
         "command": "hooshyar.undoLastWrite",
         "title": "Hooshyar: Undo Last Write",
         "icon": "$(discard)"
+      },
+      {
+        "command": "hooshyar.openDiff",
+        "title": "Hooshyar: View File Diff",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "hooshyar.revertFile",
+        "title": "Hooshyar: Revert File Changes",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "hooshyar.showLogs",
+        "title": "Hooshyar: Show Output / Debug Logs",
+        "icon": "$(output)"
+      },
+      {
+        "command": "hooshyar.copyDebugLogs",
+        "title": "Hooshyar: Copy Debug Logs to Clipboard (کپی لاگ‌های دیباگ برای بررسی بک‌اند)",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "hooshyar.toggleDebugLogging",
+        "title": "Hooshyar: Toggle Debug Logging (فعال/غیرفعال‌سازی لاگ کامل شبکه)",
+        "icon": "$(bug)"
+      },
+      {
+        "command": "hooshyar.changeAutoApproveMode",
+        "title": "Hooshyar: Change Auto-Approve Mode (تغییر حالت تایید خودکار)",
+        "icon": "$(shield)"
+      },
+      {
+        "command": "hooshyar.mcpStatus",
+        "title": "Hooshyar: View MCP Servers & Tools Status",
+        "icon": "$(server-process)"
+      },
+      {
+        "command": "hooshyar.reloadMcp",
+        "title": "Hooshyar: Reload MCP Servers",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "hooshyar.generateCommitMessage",
+        "title": "Hooshyar: Generate Commit Message (تولید پیام کامیت)",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "hooshyar.inlineChat",
+        "title": "Hooshyar: Inline Chat (ویرایش مستقیم در کد)",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "hooshyar.explainTerminal",
+        "title": "Hooshyar: Explain Terminal Error / Selection (تحلیل خطای ترمینال)",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "hooshyar.reviewChanges",
+        "title": "Hooshyar: Review Session Changes (بازبینی تغییرات نشست)",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "hooshyar.acceptAllEdits",
+        "title": "Hooshyar: Accept All Pending Changes (تأیید همه تغییرات)",
+        "icon": "$(check-all)"
+      },
+      {
+        "command": "hooshyar.discardAllEdits",
+        "title": "Hooshyar: Discard All Pending Changes (بازگردانی همه تغییرات)",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "hooshyar.suggestRename",
+        "title": "Hooshyar: AI Rename Symbol (پیشنهاد تغییر نام متغیر یا تابع)",
+        "icon": "$(rename)"
       }
     ],
     "menus": {
+      "scm/title": [
+        {
+          "command": "hooshyar.generateCommitMessage",
+          "group": "navigation"
+        }
+      ],
+      "terminal/context": [
+        {
+          "command": "hooshyar.explainTerminal",
+          "group": "navigation"
+        }
+      ],
       "view/title": [
         {
           "command": "hooshyar.newChat",
           "when": "view == hooshyar.chatView",
-          "group": "navigation"
+          "group": "navigation@1"
+        },
+        {
+          "command": "hooshyar.attachActiveFile",
+          "when": "view == hooshyar.chatView",
+          "group": "navigation@2"
         },
         {
           "command": "hooshyar.attachFile",
           "when": "view == hooshyar.chatView",
-          "group": "navigation"
+          "group": "navigation@3"
         },
         {
           "command": "hooshyar.history",
           "when": "view == hooshyar.chatView",
-          "group": "navigation"
+          "group": "navigation@4"
         },
         {
           "command": "hooshyar.openSettings",
           "when": "view == hooshyar.chatView",
+          "group": "navigation@5"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "hooshyar.addFileToChat",
+          "group": "7_modification"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "hooshyar.inlineChat",
+          "group": "1_modification@1"
+        },
+        {
+          "command": "hooshyar.suggestRename",
+          "group": "1_modification@2",
+          "when": "editorTextFocus"
+        },
+        {
+          "command": "hooshyar.addFileToChat",
+          "group": "7_modification"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "hooshyar.attachActiveFile",
           "group": "navigation"
         }
       ]
     },
+    "keybindings": [
+      {
+        "command": "hooshyar.inlineChat",
+        "key": "ctrl+i",
+        "mac": "cmd+i",
+        "when": "editorTextFocus"
+      }
+    ],
     "configuration": {
       "title": "Hooshyar",
       "properties": {
+        "hooshyar.apiFormat": {
+          "type": "string",
+          "enum": [
+            "anthropic",
+            "openai"
+          ],
+          "default": "anthropic",
+          "description": "API protocol format: 'anthropic' for Anthropic /v1/messages, 'openai' for OpenAI /v1/chat/completions."
+        },
         "hooshyar.baseUrl": {
           "type": "string",
           "default": "https://wqai.morvism.ir/v1",
-          "description": "Base URL of your custom provider, WITHOUT /v1 or /messages (e.g. https://wqai.morvism.ir). The extension appends /v1/messages itself; if you include a trailing /v1 it will be stripped automatically."
+          "description": "Base URL of your custom provider (e.g. https://wqai.morvism.ir or https://api.openai.com/v1). Endpoint path (/v1/messages or /v1/chat/completions) is handled according to apiFormat."
         },
         "hooshyar.apiKey": {
           "type": "string",
@@ -117,7 +266,7 @@
         },
         "hooshyar.model": {
           "type": "string",
-          "default": "claude-sonnet-4-6",
+          "default": "claude-sonnet-5",
           "description": "Model string to send in the 'model' field of each request. Depends on what your router accepts/maps."
         },
         "hooshyar.maxTokens": {
@@ -135,15 +284,55 @@
           "default": true,
           "description": "Allow the assistant to read/write files and list directories in your workspace via tool_use."
         },
+        "hooshyar.maxAgentTurns": {
+          "type": "number",
+          "default": 25,
+          "minimum": 5,
+          "maximum": 100,
+          "description": "Maximum number of autonomous tool execution turns the agent can execute in one request (Plan Mode)."
+        },
+        "hooshyar.mcpServers": {
+          "type": [
+            "string",
+            "object"
+          ],
+          "default": "{}",
+          "description": "MCP servers as a JSON object or JSON string. Stdio servers require command and optional args, env, cwd, disabled. Remote HTTP JSON-RPC servers may use url and optional headers. Example: {\"filesystem\":{\"command\":\"npx\",\"args\":[\"-y\",\"@modelcontextprotocol/server-filesystem\",\"${workspaceFolder}\"]}}. Note: SSE/event-stream MCP transports are not supported."
+        },
         "hooshyar.enableShellTool": {
           "type": "boolean",
-          "default": false,
+          "default": true,
           "description": "Allow the assistant to run terminal commands in your workspace (runs with YOUR permissions - review carefully before enabling)."
         },
         "hooshyar.requireApprovalForWrites": {
           "type": "boolean",
           "default": true,
-          "description": "Ask for confirmation before the assistant writes/edits any file or runs a shell command."
+          "description": "Ask for confirmation before the assistant writes or edits any file."
+        },
+        "hooshyar.requireApprovalForCommands": {
+          "type": "boolean",
+          "default": true,
+          "description": "Ask for confirmation before the assistant runs a shell command in the terminal."
+        },
+        "hooshyar.autoApproveCommands": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically approve terminal command execution without asking for manual confirmation."
+        },
+        "hooshyar.autoApproveMode": {
+          "type": "string",
+          "enum": [
+            "off",
+            "safe",
+            "all"
+          ],
+          "default": "off",
+          "description": "Auto-approve file changes without confirmation. 'off': always ask (default), 'safe': auto-approve small edits in current file, 'all': auto-approve all changes (use with caution!)."
+        },
+        "hooshyar.autoApproveSizeLimit": {
+          "type": "number",
+          "default": 5000,
+          "description": "Maximum file size (bytes) for auto-approval in 'safe' mode. Larger changes will still require manual approval."
         },
         "hooshyar.autoIncludeActiveFile": {
           "type": "boolean",
@@ -157,12 +346,12 @@
         },
         "hooshyar.enableInlineCompletions": {
           "type": "boolean",
-          "default": true,
-          "description": "Enable Copilot-style inline ghost text suggestions in the editor."
+          "default": false,
+          "description": "Enable Copilot-style inline ghost text suggestions in the editor (disabled by default to prevent unwanted background token consumption)."
         },
         "hooshyar.inlineContextChars": {
           "type": "number",
-          "default": 8000,
+          "default": 4000,
           "description": "Maximum number of surrounding characters sent to the model for each inline completion request."
         },
         "hooshyar.inlineTemperature": {
@@ -172,7 +361,11 @@
         },
         "hooshyar.toolProtocol": {
           "type": "string",
-          "enum": ["auto", "native", "text"],
+          "enum": [
+            "auto",
+            "native",
+            "text"
+          ],
           "default": "auto",
           "description": "How tool calls are sent to the provider. auto: native Anthropic tools when supported, otherwise flatten to text. native: always send tools array. text: never send native tools (best for gateways that only understand textual tool tags)."
         },
@@ -191,9 +384,19 @@
         },
         "hooshyar.maxContextChars": {
           "type": "number",
-          "default": 120000,
+          "default": 60000,
           "minimum": 10000,
-          "description": "Approximate character budget for chat history sent to the model (older turns are trimmed)."
+          "description": "Approximate character budget for chat history sent to the model (older turns are trimmed to save tokens)."
+        },
+        "hooshyar.pruneOldToolOutputs": {
+          "type": "boolean",
+          "default": true,
+          "description": "Compact large tool outputs from older turns in history to save up to 80% tokens on multi-turn chats."
+        },
+        "hooshyar.enablePromptCaching": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable Anthropic Prompt Caching for 90% discount on cached system prompts and tool definitions."
         },
         "hooshyar.maxFileSizeBytes": {
           "type": "number",
@@ -215,6 +418,11 @@
           "default": true,
           "description": "Open a diff view of proposed file changes before asking for write approval."
         },
+        "hooshyar.openDiffOnEdit": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically open VS Code's native diff editor when Hooshyar edits or modifies an existing file."
+        },
         "hooshyar.debugLogging": {
           "type": "boolean",
           "default": false,
@@ -227,8 +435,21 @@
         },
         "hooshyar.allowedShellCommands": {
           "type": "array",
-          "items": { "type": "string" },
-          "default": ["npm", "pnpm", "yarn", "node", "python", "pytest", "git", "cargo", "go", "make"],
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "npm",
+            "pnpm",
+            "yarn",
+            "node",
+            "python",
+            "pytest",
+            "git",
+            "cargo",
+            "go",
+            "make"
+          ],
           "description": "When run_command is enabled, only commands whose executable name is in this list are allowed (unless the full command matches an entry)."
         },
         "hooshyar.useRipgrep": {
@@ -243,7 +464,9 @@
         },
         "hooshyar.rulesPaths": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "default": [],
           "description": "Extra rule files relative to workspace root (also loads .cursorrules, .cursor/rules/*.md, .hooshyar/rules.md)."
         },
@@ -259,19 +482,19 @@
         },
         "hooshyar.inlineModel": {
           "type": "string",
-          "default": "",
-          "description": "Optional separate model for inline completions (defaults to hooshyar.model)."
+          "default": "claude-3-5-haiku",
+          "description": "Fast and cheap model for inline completions (defaults to claude-3-5-haiku to save tokens instead of Sonnet)."
         },
         "hooshyar.inlineMaxTokens": {
           "type": "number",
-          "default": 512,
+          "default": 256,
           "description": "max_tokens for inline completion requests."
         },
         "hooshyar.inlineDebounceMs": {
           "type": "number",
-          "default": 400,
+          "default": 750,
           "minimum": 0,
-          "description": "Debounce delay before requesting inline completions."
+          "description": "Debounce delay before requesting inline completions (higher delay saves tokens while typing)."
         },
         "hooshyar.inlineSkipComments": {
           "type": "boolean",
@@ -282,25 +505,35 @@
           "type": "number",
           "default": 4194304,
           "description": "Maximum image attachment size in bytes (PNG/JPEG/GIF/WebP)."
+        },
+        "hooshyar.enableCodeLens": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show inline code actions (Ask, Explain, Test, Refactor) above functions and classes."
+        },
+        "hooshyar.codeLensMaxItems": {
+          "type": "number",
+          "default": 50,
+          "description": "Maximum number of CodeLens items to show per file (performance limit)."
         }
       }
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
+    "vscode:prepublish": "node node_modules/typescript/bin/tsc -p ./",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "test": "npm run compile && node --test test/*.test.mjs",
+    "test": "npm run compile && node --require ./test/mockVscode.cjs --test test/*.test.mjs",
     "lint": "eslint src --ext .ts",
-    "package": "vsce package --allow-missing-repository"
+    "package": "vsce package --no-yarn --no-dependencies --allow-missing-repository"
   },
   "devDependencies": {
-    "@types/node": "^20.11.0",
+    "@types/node": "^20.19.43",
     "@types/vscode": "^1.85.0",
     "@typescript-eslint/eslint-plugin": "^7.18.0",
     "@typescript-eslint/parser": "^7.18.0",
+    "@vscode/vsce": "^2.24.0",
     "eslint": "^8.57.0",
-    "typescript": "^5.4.0",
-    "@vscode/vsce": "^2.24.0"
+    "typescript": "^5.4.0"
   }
 }

@@ -4,10 +4,82 @@ import * as fs from "fs/promises";
 import * as vscode from "vscode";
 import { ApiClient } from "./apiClient";
 import { readApiClientConfig } from "./apiConfig";
-import { logInfo } from "./logger";
+import { logInfo, logError } from "./logger";
 import { resolveWorkspaceUri } from "./workspaceUtils";
+import { getOriginalContent } from "./writeBackup";
 
 export { buildInlineDiffPreview } from "./inlineDiff";
+
+export const ORIGINAL_DOC_SCHEME = "hooshyar-original";
+
+export class HooshyarOriginalContentProvider implements vscode.TextDocumentContentProvider {
+  private _onDidChange = new vscode.EventEmitter<vscode.Uri>();
+  readonly onDidChange = this._onDidChange.event;
+
+  provideTextDocumentContent(uri: vscode.Uri): string {
+    const relPath = uri.path.replace(/^\//, "");
+    const original = getOriginalContent(relPath);
+    return original ?? "";
+  }
+
+  notifyChanged(uri: vscode.Uri) {
+    this._onDidChange.fire(uri);
+  }
+}
+
+export async function openDiffForFile(
+  relPath: string,
+  options?: { preserveFocus?: boolean; viewColumn?: vscode.ViewColumn }
+): Promise<void> {
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders?.length) return;
+
+  const normalized = relPath.trim().replace(/\\/g, "/");
+  const { uri: rightUri } = resolveWorkspaceUri(normalized);
+  const original = getOriginalContent(normalized);
+
+  // File was newly created: show it as a proper empty-to-new diff.
+  if (original === null) {
+    const leftUri = vscode.Uri.from({
+      scheme: ORIGINAL_DOC_SCHEME,
+      path: "/" + normalized,
+      query: `t=${Date.now()}`
+    });
+    const fileName = path.basename(normalized);
+    try {
+      await vscode.commands.executeCommand("vscode.diff", leftUri, rightUri, `${fileName} (جدید توسط هوشیار)`, {
+        preview: false,
+        preserveFocus: options?.preserveFocus ?? true,
+        viewColumn: options?.viewColumn
+      });
+      logInfo(`Opened new-file diff editor for: ${normalized}`);
+    } catch (err: any) {
+      logError(`Failed to open new-file diff for ${normalized}: ${err?.message ?? err}`);
+    }
+    return;
+  }
+
+  // File was modified: open side-by-side native VS Code diff
+  const leftUri = vscode.Uri.from({
+    scheme: ORIGINAL_DOC_SCHEME,
+    path: "/" + normalized,
+    query: `t=${Date.now()}`
+  });
+
+  const fileName = path.basename(normalized);
+  const title = `${fileName} (قبل ↔ بعد از ویرایش هوشیار)`;
+
+  try {
+    await vscode.commands.executeCommand("vscode.diff", leftUri, rightUri, title, {
+      preview: false,
+      preserveFocus: options?.preserveFocus ?? true,
+      viewColumn: options?.viewColumn
+    });
+    logInfo(`Opened diff editor for: ${normalized}`);
+  } catch (err: any) {
+    logError(`Failed to open diff for ${normalized}: ${err?.message ?? err}`);
+  }
+}
 
 export async function testProviderConnection(getApiKey: () => string): Promise<{ ok: boolean; message: string }> {
   const cfg = readApiClientConfig(getApiKey());

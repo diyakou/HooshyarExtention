@@ -1,1 +1,1 @@
-افزونه هشیار
+I'll create a comprehensive, professional README with detailed setup, usage instructions, and better organization while maintaining the bilingual format.

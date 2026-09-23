@@ -113,6 +113,8 @@ export interface AttachmentPreview {
   dataUrl: string;
 }
 
+export type ChatMode = "agent" | "chat";
+
 export interface ChatSession {
   id: string;
   title: string;
@@ -121,12 +123,34 @@ export interface ChatSession {
   history: Message[];
   taskList: TaskItem[];
   usage: Usage;
+  mode?: ChatMode;
 }
 
 export interface ChatSessionMeta {
   id: string;
   title: string;
   updatedAt: number;
+  mode?: ChatMode;
+}
+
+export interface SettingsData {
+  apiFormat: "anthropic" | "openai";
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  maxTokens: number;
+  temperature: number;
+  toolProtocol: "auto" | "native" | "text";
+  enableTools: boolean;
+  enableShellTool: boolean;
+  /** JSON object of stdio MCP servers; values contain command, args, env, and optional disabled. */
+  mcpServers: string;
+  requireApprovalForWrites: boolean;
+  autoApproveCommands?: boolean;
+  autoApproveMode?: "off" | "safe" | "all";
+  requireApprovalForCommands?: boolean;
+  autoIncludeActiveFile: boolean;
+  debugLogging: boolean;
 }
 
 // Messages posted between the extension host and the webview UI
@@ -144,8 +168,21 @@ export type ExtensionToWebviewMessage =
   | { type: "attachmentsUpdated"; files: string[]; images: AttachmentPreview[] }
   | { type: "usage"; inputTokens: number; outputTokens: number }
   | { type: "sessions"; sessions: ChatSessionMeta[]; currentId: string }
-  | { type: "agentWorking"; active: boolean }
-  | { type: "mentionSuggestions"; items: { path: string; label: string }[] };
+  | { type: "agentWorking"; active: boolean; statusText?: string }
+  | { type: "promptProcessing"; text?: string }
+  | { type: "mentionSuggestions"; items: { path: string; label: string }[] }
+  | { type: "settingsLoaded"; settings: SettingsData }
+  | { type: "settingsSaved"; success: boolean; message?: string }
+  | { type: "activeTurnSync"; text: string; isWorking: boolean }
+  | { type: "fileReverted"; path: string; message: string }
+  | { type: "testConnectionResult"; ok: boolean; message: string }
+  | { type: "liveToolStart"; id: string; name: string }
+  | { type: "liveToolStop"; id: string; name: string; input: Record<string, unknown> }
+  | { type: "modeChanged"; mode: ChatMode }
+  | { type: "testMcpServersResult"; statuses: { name: string; ok: boolean; message: string; tools: string[] }[] }
+  | { type: "followUpPills"; pills: string[] }
+  | { type: "sessionReviewUpdate"; files: string[] }
+  | { type: "searchWorkspaceFilesResult"; query: string; files: string[] };
 
 export type WebviewToExtensionMessage =
   | { type: "sendMessage"; text: string }
@@ -153,7 +190,7 @@ export type WebviewToExtensionMessage =
   | { type: "stop" }
   | { type: "attachFile" }
   | { type: "removeAttachment"; kind: "file" | "image"; index: number }
-  | { type: "approvalResponse"; id: string; approved: boolean }
+  | { type: "approvalResponse"; id: string; approved: boolean; alwaysApprove?: boolean }
   | { type: "openHistory" }
   | { type: "loadSession"; id: string }
   | { type: "deleteSession"; id: string }
@@ -161,4 +198,24 @@ export type WebviewToExtensionMessage =
   | { type: "retryLastTurn" }
   | { type: "insertAtCursor"; text: string }
   | { type: "searchMentions"; query: string }
-  | { type: "ready" };
+  | { type: "searchWorkspaceFiles"; query: string }
+  | { type: "reviewAcceptAll" }
+  | { type: "reviewDiscardAll" }
+  | { type: "openReviewChanges" }
+  | { type: "attachActiveFile" }
+  | { type: "attachTxtMdFile" }
+  | { type: "openExternal"; url: string }
+  | { type: "openDiff"; path: string }
+  | { type: "revertFile"; path: string }
+  | { type: "addFilesByPath"; paths: string[] }
+  | { type: "getSettings" }
+  | { type: "saveSettings"; settings: Partial<SettingsData> }
+  | { type: "testConnection"; tempSettings?: Partial<SettingsData> }
+  | { type: "testMcpServers"; rawMcpServers?: string }
+  | { type: "openSettingsModal" }
+  | { type: "copyLogs" }
+  | { type: "showLogs" }
+  | { type: "resync" }
+  | { type: "ready" }
+  | { type: "runInTerminal"; command: string }
+  | { type: "setMode"; mode: ChatMode };
