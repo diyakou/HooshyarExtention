@@ -37,8 +37,8 @@ test("OS & Terminal Compatibility Tests", async (t) => {
       assert.equal(normalizeWindowsCommand("export PORT=3000"), "set PORT=3000");
       assert.equal(normalizeWindowsCommand("export NODE_ENV=production"), "set NODE_ENV=production");
       assert.equal(normalizeWindowsCommand("which node"), "where node");
-      assert.equal(normalizeWindowsCommand("source .venv/bin/activate"), ".venv\\Scripts\\activate");
-      assert.equal(normalizeWindowsCommand("source ./venv/bin/activate"), "./venv\\Scripts\\activate");
+      assert.equal(normalizeWindowsCommand("source .venv/bin/activate"), "call .venv\\Scripts\\activate.bat");
+      assert.equal(normalizeWindowsCommand("source ./venv/bin/activate"), "call .\\venv\\Scripts\\activate.bat");
       assert.equal(normalizeWindowsCommand("source script.bat"), "call script.bat");
     } else {
       // On non-Windows, passes through unchanged
@@ -92,8 +92,12 @@ test("OS & Terminal Compatibility Tests", async (t) => {
   await t.test("assertSafeCommand allows safe variables while blocking command injection", () => {
     assert.doesNotThrow(() => assertSafeCommand("echo $env:PATH"));
     assert.doesNotThrow(() => assertSafeCommand("echo $PORT"));
+    assert.doesNotThrow(() => assertSafeCommand('python -c "import sys; print(sys.version)"'));
+    assert.doesNotThrow(() => assertSafeCommand('node -e "const a = 1; console.log(a);"'));
+    assert.doesNotThrow(() => assertSafeCommand('git commit -m "feat: user; profile"'));
     assert.throws(() => assertSafeCommand("echo $(whoami)"));
     assert.throws(() => assertSafeCommand("echo `dir`"));
+    assert.throws(() => assertSafeCommand("echo a; echo b"));
   });
 
   await t.test("buildSystemPrompt includes OS instructions and multi-project guidance", async () => {

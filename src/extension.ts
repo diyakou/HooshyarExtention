@@ -18,13 +18,39 @@ import { HooshyarQuickFixProvider, buildDiagnosticPrompt } from "./quickFixProvi
 import { ReviewManager } from "./reviewManager";
 import { MemoryManager } from "./memoryManager";
 import { HooshyarRenameSuggestionsProvider, runSuggestRenameCommand } from "./renameSuggestionsProvider";
+import { getWorkspaceCodeIndex } from "./codeIndex/workspaceCodeIndex";
+import { ProjectProfileManager } from "./projectProfile/profileManager";
+import { registerTaskProvider } from "./taskIntegration/taskProvider";
+import { getTerminalManager } from "./terminal/terminalManager";
+import { registerTestExplorer } from "./testing/testExplorerProvider";
 
 export async function activate(context: vscode.ExtensionContext) {
+  // Initialize Developer Persistent Memory Manager before creating ChatViewProvider
+  MemoryManager.getInstance().initialize(context.globalState);
+
   const provider = new ChatViewProvider(context.extensionUri, context.secrets, context.globalState);
   await provider.loadSecrets();
   logInfo("Hooshyar activated.");
 
   context.subscriptions.push(getLogger());
+  const codeIndex = getWorkspaceCodeIndex();
+  await codeIndex.initialize(vscode.Uri.joinPath(context.globalStorageUri, "indexes"));
+  context.subscriptions.push(codeIndex);
+
+  const projectProfile = new ProjectProfileManager(context.globalState);
+  // Analyze project profile on startup (background)
+  projectProfile.getProfile().catch(() => {
+    // Silent failure - profile is optional
+  });
+  const profileWatcher = vscode.workspace.createFileSystemWatcher("**/{package.json,requirements.txt,pyproject.toml,pom.xml,build.gradle,tsconfig.json}");
+  const refreshProjectProfile = () => { void projectProfile.invalidate().then(() => projectProfile.getProfile()); };
+  profileWatcher.onDidCreate(refreshProjectProfile);
+  profileWatcher.onDidChange(refreshProjectProfile);
+  profileWatcher.onDidDelete(refreshProjectProfile);
+  context.subscriptions.push(profileWatcher);
+  registerTaskProvider(context);
+  registerTestExplorer(context);
+  context.subscriptions.push(getTerminalManager());
 
   // Register virtual document provider for original content in diff editor
   context.subscriptions.push(
@@ -34,7 +60,7 @@ export async function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  let cachedInlineApiKey =
+  const cachedInlineApiKey =
     (await context.secrets.get("hooshyar.apiKey"))
     ?? vscode.workspace.getConfiguration("hooshyar").get<string>("apiKey", "");
 
@@ -333,10 +359,7 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // 6. Developer Persistent Memory Manager
-  MemoryManager.getInstance().initialize(context.globalState);
-
-  // 7. AI Rename Suggestions (F2 and Command)
+  // 6. AI Rename Suggestions (F2 and Command)
   const renameProvider = new HooshyarRenameSuggestionsProvider(() => cachedInlineApiKey);
   if ("registerNewSymbolNamesProvider" in (vscode.languages as any)) {
     try {
@@ -409,7 +432,7 @@ async function handleCodeLensAction(
     const codeBlock = `\`\`\`${language}\n${code}\n\`\`\``;
 
     switch (action) {
-      case "ask":
+      case "ask": {
         // Show input box for custom question
         const question = await vscode.window.showInputBox({
           prompt: `Ask about ${symbolName || "this code"}`,
@@ -418,6 +441,7 @@ async function handleCodeLensAction(
         if (!question) return;
         prompt = `Regarding this code from \`${fileName}\`:\n\n${codeBlock}\n\n${question}`;
         break;
+      }
 
       case "explain":
         prompt = `Please explain this code from \`${fileName}\`${symbolName ? ` (${symbolName})` : ""}:\n\n${codeBlock}\n\nProvide a clear explanation of what this code does, how it works, and any important details.`;

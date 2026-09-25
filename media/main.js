@@ -33,7 +33,37 @@
 
   const modeAgentBtn = document.getElementById("mode-agent-btn");
   const modeChatBtn = document.getElementById("mode-chat-btn");
+  const modePlanBtn = document.getElementById("mode-plan-btn");
+  const modelPicker = document.getElementById("model-picker");
+  const permissionPicker = document.getElementById("permission-picker");
+  const contextPickerBtn = document.getElementById("context-picker-btn");
+  const contextPicker = document.getElementById("context-picker");
+  const contextUsageBtn = document.getElementById("context-usage-btn");
+  const sessionSubtitle = document.getElementById("session-subtitle");
+  const sessionStatus = document.getElementById("session-status");
+  const sessionStatusText = document.getElementById("session-status-text");
+  const sessionMenuBtn = document.getElementById("session-menu-btn");
+  const sessionMenu = document.getElementById("session-menu");
+  const newActivityBtn = document.getElementById("new-activity-btn");
+  const activityFooter = document.getElementById("activity-footer");
+  const activityFooterText = document.getElementById("activity-footer-text");
+  const activityStopBtn = document.getElementById("activity-stop-btn");
+  const contextInspector = document.getElementById("context-inspector");
+  const contextInspectorBody = document.getElementById("context-inspector-body");
+  const closeContextInspector = document.getElementById("close-context-inspector");
+  const toastRegion = document.getElementById("toast-region");
   let currentMode = "agent";
+  let loadedSettings = {};
+  let modelsLoading = false;
+  let modelsLoadedAt = 0;
+  let currentUsage = { input: 0, output: 0 };
+  let attachedContext = { files: [], images: [] };
+  let userIsNearBottom = true;
+  // Webviews may restore DOM state; overlays must always start closed and only
+  // open through their explicit trigger buttons.
+  sessionMenu?.classList.add("hidden");
+  contextInspector?.classList.add("hidden");
+  contextPicker?.classList.add("hidden");
 
   const translations = {
     fa: {
@@ -189,10 +219,11 @@
   let currentLang = localStorage.getItem("hooshyar_language") || "fa";
 
   function setModeUI(mode) {
-    currentMode = mode || "agent";
-    if (modeAgentBtn && modeChatBtn) {
+    currentMode = mode === "chat" ? "ask" : (mode || "agent");
+    if (modeAgentBtn && modeChatBtn && modePlanBtn) {
       modeAgentBtn.classList.toggle("active", currentMode === "agent");
-      modeChatBtn.classList.toggle("active", currentMode === "chat");
+      modeChatBtn.classList.toggle("active", currentMode === "ask");
+      modePlanBtn.classList.toggle("active", currentMode === "plan");
     }
     updateInputPlaceholder();
   }
@@ -200,8 +231,10 @@
   function updateInputPlaceholder() {
     const t = translations[currentLang] || translations.fa;
     if (inputEl) {
-      if (currentMode === "chat") {
+      if (currentMode === "ask") {
         inputEl.placeholder = t.input_placeholder_chat || "گفتگو با هوشیار... (بدون تغییر فایل‌ها)";
+      } else if (currentMode === "plan") {
+        inputEl.placeholder = "Describe what you want to plan…";
       } else {
         inputEl.placeholder = t.input_placeholder || "از هوشیار بپرسید... (@file @workspace)";
       }
@@ -214,7 +247,9 @@
       localStorage.setItem("hooshyar_language", lang);
     } catch (_) {}
 
-    document.documentElement.dir = lang === "fa" ? "rtl" : "ltr";
+    // Keep application chrome in the native VS Code LTR layout. Individual
+    // messages and the composer determine RTL/LTR from their own content.
+    document.documentElement.dir = "ltr";
     document.documentElement.lang = lang;
 
     document.querySelectorAll("[data-i18n]").forEach((el) => {
@@ -273,6 +308,15 @@
     "list_files",
     "list_codebase",
     "search_codebase",
+    "semantic_search",
+    "find_symbol",
+    "find_definition",
+    "find_references",
+    "find_implementations",
+    "get_hover",
+    "get_document_symbols",
+    "get_call_hierarchy",
+    "rename_symbol",
     "update_tasks",
     "search_replace",
     "run_command",
@@ -327,10 +371,22 @@
     expander.textContent = `⚡ پیام‌های قدیمی‌تر جهت بهینه‌سازی جمع شدند (${totalHidden} پیام) — کلیک برای نمایش`;
   }
 
-  function scrollToBottom() {
+  function scrollToBottom(force = false) {
     pruneOldMessagesIfNeeded();
-    messagesEl.scrollTop = messagesEl.scrollHeight;
+    if (force || userIsNearBottom) {
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      userIsNearBottom = true;
+      newActivityBtn?.classList.add("hidden");
+    } else {
+      newActivityBtn?.classList.remove("hidden");
+    }
   }
+
+  messagesEl.addEventListener("scroll", () => {
+    userIsNearBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 72;
+    if (userIsNearBottom) newActivityBtn?.classList.add("hidden");
+  }, { passive: true });
+  newActivityBtn?.addEventListener("click", () => scrollToBottom(true));
 
   function autoResizeInput() {
     inputEl.style.height = "38px";
@@ -408,7 +464,9 @@
     let out = text.replace(/`([^`]+)`/g, (_m, c) => "<code>" + c + "</code>");
     out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
     out = out.replace(/(^|[^*])\*([^*]+)\*(?!\*)/g, "$1<em>$2</em>");
-    out = out.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+    out = out.replace(/(^|[\s(])([\w./\\-]+\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|cs|php|vue|svelte|html|css|scss|json|md|yml|yaml))(?:\:(\d+)(?:-(\d+))?)?/gi,
+      (_m, prefix, path, line, end) => prefix + '<button type="button" class="file-ref" data-path="' + path + '" data-line="' + (line || "") + '" title="Open ' + path + (line ? ':' + line + (end ? '-' + end : '') : '') + '">' + path + (line ? ':' + line + (end ? '-' + end : '') : '') + '</button>');
+    out = out.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2">$1</a>');
     return out;
   }
 
@@ -469,6 +527,27 @@
         continue;
       }
 
+      if (/^\s*>\s?/.test(line)) {
+        closeList();
+        html += '<blockquote>' + renderInline(line.replace(/^\s*>\s?/, "")) + '</blockquote>';
+        i++;
+        continue;
+      }
+
+      if (line.includes("|") && i + 1 < lines.length && /^\s*\|?\s*:?-{3,}/.test(lines[i + 1])) {
+        closeList();
+        const parseCells = (value) => value.replace(/^\s*\||\|\s*$/g, "").split("|").map((cell) => cell.trim());
+        const headers = parseCells(line);
+        i += 2;
+        html += '<div class="md-table-wrap"><table><thead><tr>' + headers.map((cell) => '<th>' + renderInline(cell) + '</th>').join("") + '</tr></thead><tbody>';
+        while (i < lines.length && lines[i].includes("|") && lines[i].trim()) {
+          html += '<tr>' + parseCells(lines[i]).map((cell) => '<td>' + renderInline(cell) + '</td>').join("") + '</tr>';
+          i++;
+        }
+        html += '</tbody></table></div>';
+        continue;
+      }
+
       const li = line.match(/^\s*[-*]\s+(.*)$/);
       if (li) {
         if (inList !== "ul") {
@@ -508,6 +587,7 @@
   }
 
   function displayUserText(raw) {
+    if (/^\s*\[SYSTEM:/i.test(raw || "")) return "";
     const requestMarker = "[hooshyar_user_request]";
     const taggedIndex = raw.lastIndexOf(requestMarker);
     if (taggedIndex >= 0) {
@@ -554,6 +634,12 @@
         .map((b) => b.text)
         .join("\n")
     );
+  }
+
+  function rawTextFromContent(content) {
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return "";
+    return content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
   }
 
   function addUserBubble(text) {
@@ -610,6 +696,15 @@
     list_files: { icon: "📁", verb: "فهرست فایل‌ها", enVerb: "List files" },
     list_codebase: { icon: "🗂️", verb: "کاوش ساختار پروژه", enVerb: "Explore codebase" },
     search_codebase: { icon: "🔍", verb: "جستجو در کدها", enVerb: "Search codebase" },
+    semantic_search: { icon: "⌕", verb: "جستجوی معنایی", enVerb: "Semantic search" },
+    find_symbol: { icon: "#", verb: "یافتن نماد", enVerb: "Find symbol" },
+    find_definition: { icon: "→", verb: "یافتن تعریف", enVerb: "Find definition" },
+    find_references: { icon: "↔", verb: "یافتن استفاده‌ها", enVerb: "Find references" },
+    find_implementations: { icon: "◇", verb: "یافتن پیاده‌سازی‌ها", enVerb: "Find implementations" },
+    get_hover: { icon: "i", verb: "اطلاعات نماد", enVerb: "Symbol info" },
+    get_document_symbols: { icon: "#", verb: "ساختار فایل", enVerb: "Document symbols" },
+    get_call_hierarchy: { icon: "⇄", verb: "زنجیره فراخوانی", enVerb: "Call hierarchy" },
+    rename_symbol: { icon: "✎", verb: "تغییر نام نماد", enVerb: "Rename symbol" },
     search_replace: { icon: "✂️", verb: "ویرایش قطعه‌کد", enVerb: "Patch code" },
     update_tasks: { icon: "📋", verb: "به‌روزرسانی نقشه اقدام", enVerb: "Update plan" },
     run_command: { icon: "▶️", verb: "اجرای دستور ترمینال", enVerb: "Run command" },
@@ -820,12 +915,7 @@
         revertBtn.textContent = "↩️";
         revertBtn.onclick = (e) => {
           e.stopPropagation();
-          const confirmMsg = currentLang === "fa"
-            ? `آیا از بازگردانی تغییرات فایل "${filePath}" اطمینان دارید؟`
-            : `Are you sure you want to revert changes to "${filePath}"?`;
-          if (confirm(confirmMsg)) {
-            vscode.postMessage({ type: "revertFile", path: filePath });
-          }
+          vscode.postMessage({ type: "revertFile", path: filePath });
         };
         actionsDiv.appendChild(revertBtn);
 
@@ -870,12 +960,7 @@
         bigRevertBtn.textContent = currentLang === "fa" ? "↩️ بازگردانی این فایل (Revert File)" : "↩️ Revert File Changes";
         bigRevertBtn.onclick = (e) => {
           e.stopPropagation();
-          const confirmMsg = currentLang === "fa"
-            ? `آیا از بازگردانی تغییرات فایل "${filePath}" اطمینان دارید؟`
-            : `Are you sure you want to revert changes to "${filePath}"?`;
-          if (confirm(confirmMsg)) {
-            vscode.postMessage({ type: "revertFile", path: filePath });
-          }
+          vscode.postMessage({ type: "revertFile", path: filePath });
         };
 
         toolbar.appendChild(bigDiffBtn);
@@ -963,6 +1048,8 @@
         step.outPre.classList.add("error");
         this.hasError = true;
         this.cardEl.classList.add("has-error");
+        step.stepEl.classList.remove("collapsed");
+        this.setExpanded(true);
       }
 
       this.updateHeaderProgress();
@@ -998,12 +1085,57 @@
       }
 
       const isFa = currentLang === "fa";
+      const edits = this.steps.filter((step) => ["write_file", "search_replace", "rename_symbol"].includes(step.name));
+      const commands = this.steps.filter((step) => step.name === "run_command" || step.name === "run_in_terminal");
+      const files = new Map();
+      edits.forEach((step) => {
+        const file = String(step.input?.path || "").trim();
+        if (!file) return;
+        const stats = files.get(file) || { added: 0, removed: 0 };
+        stats.added += String(step.input?.new_string ?? step.input?.content ?? "").split("\n").length;
+        stats.removed += step.name === "search_replace" ? String(step.input?.old_string || "").split("\n").length : 0;
+        files.set(file, stats);
+      });
+
+      if (files.size || commands.length) {
+        const summary = document.createElement("div");
+        summary.className = "activity-change-summary";
+        const toolbar = document.createElement("div");
+        toolbar.className = "activity-change-toolbar";
+        toolbar.innerHTML = `<strong>${files.size ? `${files.size} edited file${files.size === 1 ? "" : "s"}` : `${commands.length} command${commands.length === 1 ? "" : "s"}`}</strong><span></span>${files.size ? '<button type="button" data-undo>Undo ↶</button><button type="button" data-review>Review</button>' : ""}`;
+        summary.appendChild(toolbar);
+        files.forEach((stats, file) => {
+          const row = document.createElement("button");
+          row.type = "button";
+          row.className = "activity-change-row";
+          row.innerHTML = '<span></span><b class="added">+' + stats.added + '</b><b class="removed">-' + stats.removed + '</b>';
+          row.querySelector("span").textContent = file;
+          row.onclick = () => vscode.postMessage({ type: "openDiff", path: file });
+          summary.appendChild(row);
+        });
+        commands.forEach((step) => {
+          const row = document.createElement("div");
+          const failed = step.stepEl.classList.contains("error");
+          row.className = "activity-command-row";
+          row.innerHTML = '<span>›</span><code></code><b class="' + (failed ? "failed" : "passed") + '">' + (failed ? "Failed" : "Passed") + '</b>';
+          row.querySelector("code").textContent = String(step.input?.command || "command");
+          summary.appendChild(row);
+        });
+        toolbar.querySelector("[data-review]")?.addEventListener("click", () => vscode.postMessage({ type: "openReviewChanges" }));
+        toolbar.querySelector("[data-undo]")?.addEventListener("click", () => {
+          vscode.postMessage({ type: "reviewDiscardAll" });
+        });
+        this.bodyEl.insertBefore(summary, this.stepListEl);
+      }
+
+      const labels = [];
+      if (files.size) labels.push(isFa ? `${files.size} فایل ویرایش شد` : `${files.size} edited file${files.size === 1 ? "" : "s"}`);
+      if (commands.length) labels.push(isFa ? `${commands.length} دستور اجرا شد` : `${commands.length} command${commands.length === 1 ? "" : "s"} run`);
+      if (this.hasError) labels.push(isFa ? "دارای خطا" : "with errors");
       this.statusIconEl.textContent = this.hasError ? "⚠" : "✓";
-      this.titleEl.textContent = this.hasError
-        ? (isFa ? "فعالیت‌ها با خطا پایان یافت" : "Activity completed with errors")
-        : (isFa ? "کارهای انجام‌شده" : "Work completed");
+      this.titleEl.textContent = labels.join(" · ") || (isFa ? "جزئیات عملیات" : "Operation details");
       this.badgeEl.textContent = String(total);
-      this.setExpanded(this.hasError);
+      this.setExpanded(Boolean(files.size || commands.length || this.hasError));
     }
   }
 
@@ -1109,13 +1241,14 @@
 
     for (const m of messages || []) {
       if (m.role === "user") {
+        const rawText = rawTextFromContent(m.content);
         const text = userTextFromContent(m.content);
-        if (text.startsWith("[Auto-compacted context")) {
+        if (rawText.includes("[Auto-compacted context")) {
           if (pendingHistoryCard) {
             pendingHistoryCard.finalize();
             pendingHistoryCard = null;
           }
-          renderContextCompactCard(text);
+          renderContextCompactCard(rawText.slice(rawText.indexOf("[Auto-compacted context")));
           continue;
         }
         const images =
@@ -1223,8 +1356,8 @@
     details.className = "context-compact-card";
     const summary = document.createElement("summary");
     summary.textContent = stats
-      ? `Context compacted · ${formatTokens(stats.beforeTokens)} → ${formatTokens(stats.afterTokens)} tokens`
-      : "Context compacted · older turns summarized";
+      ? `Context compressed automatically · ${formatTokens(stats.beforeTokens)} → ${formatTokens(stats.afterTokens)} tokens`
+      : (currentLang === "fa" ? "کانتکست قدیمی به‌صورت خودکار فشرده شد" : "Older context compressed automatically");
     details.appendChild(summary);
     if (text) {
       const body = document.createElement("div");
@@ -1333,13 +1466,35 @@
       return;
     }
 
+    const currentSession = (sessions || []).find((s) => s.id === currentId);
+    const cleanTitle = (value) => {
+      const title = String(value || "").replace(/<[^>]*>/g, " ").replace(/&(?:nbsp|#x20);/gi, " ").replace(/\s+/g, " ").trim();
+      return !title || /^\[SYSTEM:/i.test(title) ? "New session" : title;
+    };
+    if (sessionSubtitle) sessionSubtitle.textContent = currentSession ? cleanTitle(currentSession.title) : "New session";
+    let lastGroup = "";
     for (const s of sessions) {
+      const ageDays = Math.floor((Date.now() - Number(s.updatedAt || 0)) / 86400000);
+      const group = ageDays <= 0 ? "Today" : ageDays === 1 ? "Yesterday" : "Earlier";
+      if (group !== lastGroup) {
+        const heading = document.createElement("div");
+        heading.className = "session-group-heading";
+        heading.textContent = group;
+        sessionListEl.appendChild(heading);
+        lastGroup = group;
+      }
       const row = document.createElement("div");
       row.className = "session-row" + (s.id === currentId ? " active" : "");
+      row.setAttribute("tabindex", "0");
+      row.setAttribute("role", "button");
+      row.onkeydown = (event) => { if (event.key === "Enter" || event.key === " ") vscode.postMessage({ type: "loadSession", id: s.id }); };
+      const state = document.createElement("span");
+      state.className = "session-row-state";
+      state.textContent = s.id === currentId && isStreamingActive ? "●" : "○";
       const title = document.createElement("span");
       title.className = "session-title";
-      title.textContent = s.title || "(untitled)";
-      title.title = s.title || "";
+      title.textContent = cleanTitle(s.title);
+      title.title = cleanTitle(s.title);
       title.onclick = () => vscode.postMessage({ type: "loadSession", id: s.id });
       const actions = document.createElement("span");
       actions.className = "session-actions";
@@ -1349,10 +1504,7 @@
       renameBtn.title = "Rename";
       renameBtn.onclick = (e) => {
         e.stopPropagation();
-        const next = prompt("Rename chat", s.title || "");
-        if (next !== null && next.trim()) {
-          vscode.postMessage({ type: "renameSession", id: s.id, title: next.trim() });
-        }
+        vscode.postMessage({ type: "promptRenameSession", id: s.id });
       };
       const delBtn = document.createElement("button");
       delBtn.type = "button";
@@ -1360,12 +1512,11 @@
       delBtn.title = "Delete";
       delBtn.onclick = (e) => {
         e.stopPropagation();
-        if (confirm("Delete this chat?")) {
-          vscode.postMessage({ type: "deleteSession", id: s.id });
-        }
+        vscode.postMessage({ type: "deleteSession", id: s.id });
       };
       actions.appendChild(renameBtn);
       actions.appendChild(delBtn);
+      row.appendChild(state);
       row.appendChild(title);
       row.appendChild(actions);
       sessionListEl.appendChild(row);
@@ -1381,6 +1532,9 @@
     { label: "#selection", desc: "کد انتخاب‌شده در ادیتور فعال / Active selection", insert: "#selection " },
     { label: "#editor", desc: "کل سند فعال در ادیتور / Active editor entire file", insert: "#editor " },
     { label: "#git", desc: "تغییرات جاری گیت (Git Diff) / Current git diff", insert: "#git " },
+    { label: "#problems", desc: "خطاها و هشدارهای پروژه / Workspace diagnostics", insert: "#problems " },
+    { label: "#tests", desc: "فایل‌های تست پروژه / Test files", insert: "#tests " },
+    { label: "#codebase", desc: "نمای کلی فایل‌های پروژه / Codebase map", insert: "#codebase " },
     { label: "#terminal", desc: "خروجی یا بافر ترمینال / Terminal buffer", insert: "#terminal " }
   ];
 
@@ -1563,6 +1717,7 @@
   }
 
   function renderAttachmentsBar(files, images) {
+    attachedContext = { files: files || [], images: images || [] };
     const hasFiles = files && files.length > 0;
     const hasImages = images && images.length > 0;
     if (!hasFiles && !hasImages) {
@@ -1620,6 +1775,33 @@
     });
 
     attachmentsBar.appendChild(list);
+    renderContextInspector();
+  }
+
+  function renderContextInspector() {
+    if (!contextInspectorBody) return;
+    const contextTotal = currentUsage.context || 0;
+    const contextMax = currentUsage.max || 15000;
+    const rows = [
+      ["Current context", formatTokens(contextTotal) + " / " + formatTokens(contextMax)],
+      ["Session usage", formatTokens(currentUsage.input + currentUsage.output) + " tokens"],
+      ["Attached files", String(attachedContext.files.length)],
+      ["Images", String(attachedContext.images.length)],
+      ["Mode", currentMode.charAt(0).toUpperCase() + currentMode.slice(1)],
+      ["Rules & skills", "Active when configured"]
+    ];
+    contextInspectorBody.innerHTML = rows.map(([label, value]) => '<div class="context-inspector-row"><span>' + label + '</span><strong>' + value + '</strong></div>').join("") +
+      (attachedContext.files.length ? '<div class="context-file-list">' + attachedContext.files.map((file) => '<button type="button" class="file-ref" data-path="' + escapeHtml(file) + '">' + escapeHtml(file) + '</button>').join("") + '</div>' : '<div class="context-empty">No manually attached files</div>');
+  }
+
+  function showToast(message, kind = "info") {
+    if (!toastRegion) return;
+    const toast = document.createElement("div");
+    toast.className = "toast " + kind;
+    toast.textContent = message;
+    toastRegion.appendChild(toast);
+    requestAnimationFrame(() => toast.classList.add("visible"));
+    setTimeout(() => { toast.classList.remove("visible"); setTimeout(() => toast.remove(), 180); }, 2200);
   }
 
 
@@ -1668,10 +1850,21 @@
     if (attachTxtMdBtn) attachTxtMdBtn.disabled = active;
     if (attachActiveBtn) attachActiveBtn.disabled = active;
     if (active) {
+      activityFooter?.classList.remove("hidden");
+      if (activityFooterText) activityFooterText.textContent = currentMode === "plan" ? "Planning…" : "Working…";
+      updateSessionStatus("running", currentLang === "fa" ? "در حال اجرا" : "Running");
       showThinkingBubble();
     } else {
+      activityFooter?.classList.add("hidden");
+      updateSessionStatus("completed", currentLang === "fa" ? "تکمیل شد" : "Completed");
       hideThinkingBubble();
     }
+  }
+
+  function updateSessionStatus(kind, label) {
+    if (!sessionStatus || !sessionStatusText) return;
+    sessionStatus.className = "session-status " + kind;
+    sessionStatusText.textContent = label;
   }
 
   let planCollapsed = false;
@@ -1726,6 +1919,17 @@
       setElementDirection(row, t.content);
       row.textContent = `${statusIcon[t.status] || "\u25CB"} ${t.content}`;
       listBody.appendChild(row);
+    }
+    if (currentMode === "plan") {
+      const planActions = document.createElement("div");
+      planActions.className = "plan-actions";
+      planActions.innerHTML = '<button type="button" data-edit-plan>Edit plan</button><button type="button" class="primary" data-implement-plan>Implement plan</button>';
+      planActions.querySelector("[data-edit-plan]").onclick = () => { inputEl.value = "Revise the plan: "; autoResizeInput(); inputEl.focus(); };
+      planActions.querySelector("[data-implement-plan]").onclick = () => {
+        setModeUI("agent"); vscode.postMessage({ type: "setMode", mode: "agent" });
+        inputEl.value = "Implement the approved plan."; formEl.requestSubmit();
+      };
+      listBody.appendChild(planActions);
     }
     taskListEl.appendChild(listBody);
   }
@@ -1928,18 +2132,28 @@
         renderTaskList(msg.tasks);
         break;
       case "usage": {
-        const total = (msg.inputTokens || 0) + (msg.outputTokens || 0);
+        const contextTokens = msg.contextTokens || 0;
+        const maxContext = msg.maxContextTokens || 15000;
+        currentUsage = { input: msg.inputTokens || 0, output: msg.outputTokens || 0, context: contextTokens, max: maxContext };
+        const percent = Math.min(100, Math.round((contextTokens / Math.max(maxContext, 1)) * 100));
+        if (contextUsageBtn) {
+          contextUsageBtn.textContent = `Context ${percent}%${percent >= 80 ? " ⚠" : ""}`;
+          contextUsageBtn.classList.toggle("warning", percent >= 80);
+          contextUsageBtn.title = `Current context ${formatTokens(contextTokens)} / ${formatTokens(maxContext)} estimated tokens`;
+        }
         usageInfo.textContent =
-          formatTokens(total) +
-          " tokens  (\u2191 " +
+          formatTokens(contextTokens) + " / " + formatTokens(maxContext) +
+          " context  (session \u2191 " +
           formatTokens(msg.inputTokens || 0) +
           " \u2193 " +
           formatTokens(msg.outputTokens || 0) +
           ")";
+        renderContextInspector();
         break;
       }
       case "contextCompacted":
         renderContextCompactCard("", msg);
+        showToast(`Context compacted: ${formatTokens(msg.beforeTokens)} → ${formatTokens(msg.afterTokens)} tokens`);
         break;
       case "sessions":
         renderSessionList(msg.sessions, msg.currentId);
@@ -1953,6 +2167,7 @@
       case "agentWorking":
         if (msg.active) {
           const defaultWorking = currentLang === "fa" ? "در حال کاوش و کار روی پروژه..." : "Working on workspace...";
+          if (activityFooterText) activityFooterText.textContent = msg.statusText || defaultWorking;
           showThinkingBubble(msg.statusText || defaultWorking);
         } else {
           hideThinkingBubble();
@@ -2007,6 +2222,14 @@
         hideThinkingBubble();
         currentAssistantBubble = null;
         currentAssistantRaw = "";
+        if (currentMode === "agent" && messagesEl.querySelector(".agent-activity-card")) {
+          const summary = document.createElement("div");
+          summary.className = "completion-summary";
+          const steps = messagesEl.querySelectorAll(".activity-step.ok").length;
+          summary.innerHTML = '<span class="completion-icon">✓</span><span><strong>Task completed</strong><small>' + steps + ' tool step' + (steps === 1 ? '' : 's') + '</small></span><button type="button" data-review>Review changes</button>';
+          summary.querySelector("[data-review]").onclick = () => vscode.postMessage({ type: "openReviewChanges" });
+          messagesEl.appendChild(summary);
+        }
         scrollToBottom();
         break;
       case "toolCall":
@@ -2029,6 +2252,7 @@
         addToolResult(msg.id, msg.content, msg.isError);
         break;
       case "approvalRequest": {
+        updateSessionStatus("waiting", currentLang === "fa" ? "نیازمند تایید" : "Approval required");
         approvalBanner.classList.remove("hidden");
         approvalBanner.innerHTML = "";
 
@@ -2079,6 +2303,7 @@
         approveBtn.onclick = () => {
           vscode.postMessage({ type: "approvalResponse", id: msg.id, approved: true });
           approvalBanner.classList.add("hidden");
+          updateSessionStatus("running", currentLang === "fa" ? "در حال اجرا" : "Running");
         };
 
         const denyBtn = document.createElement("button");
@@ -2088,6 +2313,7 @@
         denyBtn.onclick = () => {
           vscode.postMessage({ type: "approvalResponse", id: msg.id, approved: false });
           approvalBanner.classList.add("hidden");
+          updateSessionStatus("idle", currentLang === "fa" ? "رد شد" : "Denied");
         };
 
         const alwaysBtn = document.createElement("button");
@@ -2125,14 +2351,55 @@
       }
       case "error": {
         const div = document.createElement("div");
-        div.className = "bubble error";
-        div.textContent = "Error: " + msg.message;
+        div.className = "error-card";
+        div.innerHTML = '<div class="error-card-title"><span>!</span><strong>Request failed</strong></div><div class="error-card-message"></div><div class="error-card-actions"><button type="button" data-retry>Retry</button><button type="button" data-logs>View logs</button></div>';
+        div.querySelector(".error-card-message").textContent = msg.message;
+        div.querySelector("[data-retry]").onclick = () => vscode.postMessage({ type: "retryLastTurn" });
+        div.querySelector("[data-logs]").onclick = () => vscode.postMessage({ type: "showLogs" });
         messagesEl.appendChild(div);
+        updateSessionStatus("failed", "Failed");
+        showToast("Request failed", "error");
         scrollToBottom();
         break;
       }
       case "settingsLoaded": {
+        loadedSettings = msg.settings || {};
         populateSettings(msg.settings);
+        const contextIndicator = document.getElementById("active-rules-indicator");
+        if (contextIndicator) {
+          const skillCount = Array.isArray(msg.settings.skills) ? msg.settings.skills.length : 0;
+          let mcpCount = 0;
+          try { mcpCount = Object.keys(JSON.parse(msg.settings.mcpServers || "{}")).length; } catch (_) {}
+          contextIndicator.textContent = `${skillCount} Skills · MCP ${mcpCount}`;
+          contextIndicator.title = "Active skills and MCP servers";
+        }
+        if (modelPicker) {
+          const model = msg.settings.model || "claude-sonnet-5";
+          modelPicker.innerHTML = "";
+          const option = document.createElement("option"); option.value = model; option.textContent = model; modelPicker.appendChild(option);
+          modelPicker.value = model;
+        }
+        if (permissionPicker) {
+          permissionPicker.value = msg.settings.autoApproveCommands && msg.settings.autoApproveMode === "all" ? "full"
+            : msg.settings.autoApproveMode === "all" ? "edit"
+            : msg.settings.autoApproveMode === "safe" ? "safe" : "ask";
+        }
+        break;
+      }
+      case "modelsLoaded": {
+        modelsLoading = false;
+        modelsLoadedAt = Date.now();
+        if (!modelPicker) break;
+        const selected = msg.selectedModel || loadedSettings.model || "";
+        const models = [selected, ...(msg.models || [])].filter((value, index, array) => value && array.indexOf(value) === index);
+        modelPicker.innerHTML = "";
+        models.forEach((value) => {
+          const option = document.createElement("option"); option.value = value; option.textContent = value; modelPicker.appendChild(option);
+        });
+        modelPicker.value = selected;
+        modelPicker.title = msg.error ? `Could not load /v1/models: ${msg.error}` : `${msg.models.length} models loaded from /v1/models`;
+        modelPicker.classList.toggle("load-error", Boolean(msg.error));
+        if (msg.error) showToast("Could not load model list; current model was preserved.", "error");
         break;
       }
       case "settingsSaved": {
@@ -2158,6 +2425,18 @@
         testMcpStatus.innerHTML = msg.statuses
           .map((s) => `<div>${s.ok ? "✓" : "✕"} <b>${s.name}</b>: ${s.message}</div>`)
           .join("");
+        break;
+      }
+      case "figmaAuthStatus": {
+        updateFigmaStatusUI(msg.authenticated, msg.expiresAt, msg.error);
+        break;
+      }
+      case "figmaAuthResult": {
+        if (figmaAuthStatus) {
+          figmaAuthStatus.className = "test-status " + (msg.success ? "ok" : "error");
+          figmaAuthStatus.textContent = (msg.success ? "✓ " : "✕ ") + msg.message;
+        }
+        updateFigmaStatusUI(msg.authenticated);
         break;
       }
       case "skillsAdded": {
@@ -2216,6 +2495,11 @@
   const cfgAutoCompact = document.getElementById("cfg-auto-compact");
   const cfgDebugLogging = document.getElementById("cfg-debug-logging");
   const cfgMcpServers = document.getElementById("cfg-mcp-servers");
+  const figmaLoginBtn = document.getElementById("figma-login-btn");
+  const figmaLogoutBtn = document.getElementById("figma-logout-btn");
+  const figmaDesktopBtn = document.getElementById("figma-desktop-btn");
+  const figmaAuthBadge = document.getElementById("figma-auth-badge");
+  const figmaAuthStatus = document.getElementById("figma-auth-status");
   const skillsList = document.getElementById("skills-list");
   const addSkillBtn = document.getElementById("add-skill-btn");
   const skillsStatus = document.getElementById("skills-status");
@@ -2224,6 +2508,28 @@
   const copyLogsBtn = document.getElementById("copy-logs-btn");
   const showLogsBtn = document.getElementById("show-logs-btn");
   let configuredSkills = [];
+
+  function updateFigmaStatusUI(auth, expiresAt, error) {
+    if (!figmaAuthBadge) return;
+    if (auth) {
+      figmaAuthBadge.className = "figma-badge connected";
+      let expText = "";
+      if (expiresAt) {
+        try {
+          const d = new Date(expiresAt);
+          expText = ` (انقضا: ${d.toLocaleDateString("fa-IR")})`;
+        } catch (_) {}
+      }
+      figmaAuthBadge.textContent = "🟢 متصل به اکانت فیگما" + expText;
+      if (figmaLoginBtn) figmaLoginBtn.classList.add("hidden");
+      if (figmaLogoutBtn) figmaLogoutBtn.classList.remove("hidden");
+    } else {
+      figmaAuthBadge.className = "figma-badge disconnected";
+      figmaAuthBadge.textContent = error ? "⚠️ " + error : "⚪ اکانت متصل نیست";
+      if (figmaLoginBtn) figmaLoginBtn.classList.remove("hidden");
+      if (figmaLogoutBtn) figmaLogoutBtn.classList.add("hidden");
+    }
+  }
 
   function renderSkills() {
     if (!skillsList) return;
@@ -2361,6 +2667,36 @@
     });
   }
 
+  if (figmaLoginBtn) {
+    figmaLoginBtn.addEventListener("click", () => {
+      if (figmaAuthStatus) {
+        figmaAuthStatus.className = "test-status testing";
+        figmaAuthStatus.textContent = "در حال باز کردن مرورگر و انتظار برای تایید ورود در فیگما...";
+      }
+      vscode.postMessage({ type: "loginFigma" });
+    });
+  }
+
+  if (figmaLogoutBtn) {
+    figmaLogoutBtn.addEventListener("click", () => {
+      if (figmaAuthStatus) {
+        figmaAuthStatus.className = "test-status testing";
+        figmaAuthStatus.textContent = "در حال خروج...";
+      }
+      vscode.postMessage({ type: "logoutFigma" });
+    });
+  }
+
+  if (figmaDesktopBtn) {
+    figmaDesktopBtn.addEventListener("click", () => {
+      if (figmaAuthStatus) {
+        figmaAuthStatus.className = "test-status testing";
+        figmaAuthStatus.textContent = "در حال تنظیم سرور دسکتاپ...";
+      }
+      vscode.postMessage({ type: "configureFigmaDesktop" });
+    });
+  }
+
   if (testMcpBtn) {
     testMcpBtn.addEventListener("click", () => {
       testMcpStatus.className = "test-status testing";
@@ -2417,6 +2753,12 @@
 
   // Event delegation for code-copy/insert buttons, prompt chips, and message actions
   messagesEl.addEventListener("click", (e) => {
+    const fileRef = e.target.closest(".file-ref");
+    if (fileRef) {
+      vscode.postMessage({ type: "openFile", path: fileRef.dataset.path, line: Number(fileRef.dataset.line || 0) || undefined });
+      return;
+    }
+
     const runBtn = e.target.closest(".code-run-btn");
     if (runBtn) {
       const codeBlock = runBtn.closest(".code-block");
@@ -2560,10 +2902,159 @@
 
   if (modeChatBtn) {
     modeChatBtn.addEventListener("click", () => {
-      setModeUI("chat");
-      vscode.postMessage({ type: "setMode", mode: "chat" });
+      setModeUI("ask");
+      vscode.postMessage({ type: "setMode", mode: "ask" });
     });
   }
+
+  if (modePlanBtn) {
+    modePlanBtn.addEventListener("click", () => {
+      setModeUI("plan");
+      vscode.postMessage({ type: "setMode", mode: "plan" });
+    });
+  }
+
+  if (modelPicker) {
+    const refreshModels = () => {
+      if (modelsLoading || Date.now() - modelsLoadedAt < 30_000) return;
+      modelsLoading = true;
+      modelPicker.title = "Loading models from /v1/models…";
+      vscode.postMessage({ type: "requestModels" });
+    };
+    modelPicker.addEventListener("focus", refreshModels);
+    modelPicker.addEventListener("pointerdown", refreshModels);
+    modelPicker.addEventListener("change", () => {
+      loadedSettings.model = modelPicker.value;
+      vscode.postMessage({ type: "saveSettings", settings: { model: modelPicker.value } });
+    });
+  }
+
+  if (permissionPicker) {
+    permissionPicker.addEventListener("change", () => {
+      const value = permissionPicker.value;
+      const settings = value === "full"
+        ? { autoApproveMode: "all", autoApproveCommands: true, requireApprovalForCommands: false, requireApprovalForWrites: false }
+        : value === "edit"
+          ? { autoApproveMode: "all", autoApproveCommands: false, requireApprovalForCommands: true, requireApprovalForWrites: false }
+          : value === "safe"
+            ? { autoApproveMode: "safe", autoApproveCommands: false, requireApprovalForCommands: true, requireApprovalForWrites: true }
+            : { autoApproveMode: "off", autoApproveCommands: false, requireApprovalForCommands: true, requireApprovalForWrites: true };
+      vscode.postMessage({ type: "saveSettings", settings });
+    });
+  }
+
+  if (contextPickerBtn && contextPicker) {
+    const closeContextPicker = () => { contextPicker.classList.add("hidden"); contextPickerBtn.setAttribute("aria-expanded", "false"); };
+    contextPickerBtn.addEventListener("click", () => {
+      const opening = contextPicker.classList.contains("hidden");
+      sessionMenu?.classList.add("hidden");
+      sessionMenuBtn?.setAttribute("aria-expanded", "false");
+      contextInspector?.classList.add("hidden");
+      contextUsageBtn?.setAttribute("aria-expanded", "false");
+      contextPicker.classList.toggle("hidden", !opening);
+      contextPickerBtn.setAttribute("aria-expanded", String(opening));
+      if (opening) contextPicker.querySelector("button")?.focus();
+    });
+    contextPicker.addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-context]");
+      if (!button) return;
+      const kind = button.dataset.context;
+      if (kind === "file") vscode.postMessage({ type: "attachFile" });
+      else if (kind === "active") vscode.postMessage({ type: "attachActiveFile" });
+      else {
+        const aliases = { selection: "#selection", problems: "#problems", git: "#git", codebase: "#codebase" };
+        inputEl.value += (inputEl.value && !inputEl.value.endsWith(" ") ? " " : "") + aliases[kind] + " ";
+        inputEl.dispatchEvent(new Event("input")); inputEl.focus();
+      }
+
+      closeContextPicker();
+    });
+    contextPicker.addEventListener("keydown", (event) => {
+      const buttons = Array.from(contextPicker.querySelectorAll("button"));
+      const index = buttons.indexOf(document.activeElement);
+      if (event.key === "Escape") { closeContextPicker(); contextPickerBtn.focus(); }
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        buttons[(index + (event.key === "ArrowDown" ? 1 : -1) + buttons.length) % buttons.length].focus();
+      }
+    });
+  }
+
+  if (contextUsageBtn && contextInspector) {
+    contextUsageBtn.addEventListener("click", () => {
+      renderContextInspector();
+      sessionMenu?.classList.add("hidden");
+      sessionMenuBtn?.setAttribute("aria-expanded", "false");
+      contextPicker?.classList.add("hidden");
+      contextPickerBtn?.setAttribute("aria-expanded", "false");
+      const opening = contextInspector.classList.contains("hidden");
+      contextInspector.classList.toggle("hidden", !opening);
+      contextUsageBtn.setAttribute("aria-expanded", String(opening));
+      if (opening) closeContextInspector?.focus();
+    });
+    closeContextInspector?.addEventListener("click", () => { contextInspector.classList.add("hidden"); contextUsageBtn.setAttribute("aria-expanded", "false"); contextUsageBtn.focus(); });
+    contextInspector.addEventListener("click", (event) => {
+      const ref = event.target.closest(".file-ref");
+      if (ref) vscode.postMessage({ type: "openFile", path: ref.dataset.path });
+    });
+  }
+
+  const requestStop = () => {
+    if (!isStreamingActive) return;
+    if (activityFooterText) activityFooterText.textContent = "Stopping…";
+    updateSessionStatus("waiting", "Stopping…");
+    vscode.postMessage({ type: "stop" });
+  };
+  activityStopBtn?.addEventListener("click", requestStop);
+
+  if (sessionMenuBtn && sessionMenu) {
+    const closeSessionMenu = () => { sessionMenu.classList.add("hidden"); sessionMenuBtn.setAttribute("aria-expanded", "false"); };
+    sessionMenuBtn.addEventListener("click", () => {
+      const opening = sessionMenu.classList.contains("hidden");
+      contextPicker?.classList.add("hidden");
+      contextPickerBtn?.setAttribute("aria-expanded", "false");
+      contextInspector?.classList.add("hidden");
+      contextUsageBtn?.setAttribute("aria-expanded", "false");
+      sessionMenu.classList.toggle("hidden", !opening);
+      sessionMenuBtn.setAttribute("aria-expanded", String(opening));
+      if (opening) sessionMenu.querySelector("button")?.focus();
+    });
+    sessionMenu.addEventListener("click", (event) => {
+      const action = event.target.closest("button[data-action]")?.dataset.action;
+      if (!action) return;
+      if (action === "new" || action === "clear") vscode.postMessage({ type: "newChat" });
+      if (action === "history") vscode.postMessage({ type: "openHistory" });
+      if (action === "settings") vscode.postMessage({ type: "openSettingsModal" });
+      if (action === "rename" && currentSessionId) {
+        vscode.postMessage({ type: "promptRenameSession", id: currentSessionId });
+      }
+      if (action === "delete" && currentSessionId) {
+        vscode.postMessage({ type: "deleteSession", id: currentSessionId });
+      }
+      closeSessionMenu();
+    });
+    sessionMenu.addEventListener("keydown", (event) => {
+      const buttons = Array.from(sessionMenu.querySelectorAll("button"));
+      const index = buttons.indexOf(document.activeElement);
+      if (event.key === "Escape") { closeSessionMenu(); sessionMenuBtn.focus(); }
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault(); buttons[(index + (event.key === "ArrowDown" ? 1 : -1) + buttons.length) % buttons.length].focus();
+      }
+    });
+  }
+
+  document.addEventListener("click", (event) => {
+    if (sessionMenu && sessionMenuBtn && !sessionMenu.contains(event.target) && !sessionMenuBtn.contains(event.target)) {
+      sessionMenu.classList.add("hidden"); sessionMenuBtn.setAttribute("aria-expanded", "false");
+    }
+    if (contextPicker && contextPickerBtn && !contextPicker.contains(event.target) && !contextPickerBtn.contains(event.target)) {
+      contextPicker.classList.add("hidden"); contextPickerBtn.setAttribute("aria-expanded", "false");
+    }
+    if (contextInspector && contextUsageBtn && !contextInspector.contains(event.target) && !contextUsageBtn.contains(event.target)) {
+      contextInspector.classList.add("hidden");
+      contextUsageBtn.setAttribute("aria-expanded", "false");
+    }
+  });
 
   const TELEGRAM_URL = "https://t.me/lildevelop";
   const TELEGRAM_HANDLE = "@lildevelop";
@@ -2621,6 +3112,9 @@
   });
 
   vscode.postMessage({ type: "ready" });
+  vscode.postMessage({ type: "getSettings" });
+  vscode.postMessage({ type: "requestModels" });
+  modelsLoading = true;
   setLanguage(currentLang);
   autoResizeInput();
   renderChatEmpty();

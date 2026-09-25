@@ -113,7 +113,7 @@ export interface AttachmentPreview {
   dataUrl: string;
 }
 
-export type ChatMode = "agent" | "chat";
+export type ChatMode = "ask" | "plan" | "agent" | "chat";
 
 export interface ChatSession {
   id: string;
@@ -174,7 +174,7 @@ export type ExtensionToWebviewMessage =
   | { type: "streaming"; active: boolean }
   | { type: "filesAttached"; files: string[] }
   | { type: "attachmentsUpdated"; files: string[]; images: AttachmentPreview[] }
-  | { type: "usage"; inputTokens: number; outputTokens: number }
+  | { type: "usage"; inputTokens: number; outputTokens: number; contextTokens: number; maxContextTokens: number }
   | { type: "contextCompacted"; beforeTokens: number; afterTokens: number }
   | { type: "sessions"; sessions: ChatSessionMeta[]; currentId: string }
   | { type: "agentWorking"; active: boolean; statusText?: string }
@@ -192,7 +192,10 @@ export type ExtensionToWebviewMessage =
   | { type: "skillsAdded"; skills: SkillReference[]; message: string }
   | { type: "followUpPills"; pills: string[] }
   | { type: "sessionReviewUpdate"; files: string[] }
-  | { type: "searchWorkspaceFilesResult"; query: string; files: string[] };
+  | { type: "searchWorkspaceFilesResult"; query: string; files: string[] }
+  | { type: "modelsLoaded"; models: string[]; selectedModel: string; error?: string }
+  | { type: "figmaAuthStatus"; authenticated: boolean; expiresAt?: number; error?: string }
+  | { type: "figmaAuthResult"; success: boolean; message: string; authenticated: boolean };
 
 export type WebviewToExtensionMessage =
   | { type: "sendMessage"; text: string }
@@ -205,6 +208,7 @@ export type WebviewToExtensionMessage =
   | { type: "loadSession"; id: string }
   | { type: "deleteSession"; id: string }
   | { type: "renameSession"; id: string; title: string }
+  | { type: "promptRenameSession"; id: string }
   | { type: "retryLastTurn" }
   | { type: "insertAtCursor"; text: string }
   | { type: "searchMentions"; query: string }
@@ -216,6 +220,7 @@ export type WebviewToExtensionMessage =
   | { type: "attachTxtMdFile" }
   | { type: "openExternal"; url: string }
   | { type: "openDiff"; path: string }
+  | { type: "openFile"; path: string; line?: number }
   | { type: "revertFile"; path: string }
   | { type: "addFilesByPath"; paths: string[] }
   | { type: "getSettings" }
@@ -229,4 +234,9 @@ export type WebviewToExtensionMessage =
   | { type: "resync" }
   | { type: "ready" }
   | { type: "runInTerminal"; command: string }
-  | { type: "setMode"; mode: ChatMode };
+  | { type: "setMode"; mode: ChatMode }
+  | { type: "requestModels" }
+  | { type: "getFigmaAuthStatus" }
+  | { type: "loginFigma" }
+  | { type: "logoutFigma" }
+  | { type: "configureFigmaDesktop" };

@@ -2,10 +2,12 @@ const Module = require("module");
 const origRequire = Module.prototype.require;
 
 const mockConfig = new Map();
+let vscodeMock;
 
 Module.prototype.require = function (id) {
   if (id === "vscode") {
-    return {
+    if (vscodeMock) return vscodeMock;
+    return vscodeMock = {
       workspace: {
         workspaceFolders: [],
         fs: {},
@@ -25,7 +27,11 @@ Module.prototype.require = function (id) {
           update: async (key, val) => {
             mockConfig.set(key, val);
           }
-        })
+        }),
+        openTextDocument: async () => ({ languageId: "plaintext", getText: () => "" }),
+        findFiles: async () => [],
+        createFileSystemWatcher: () => ({ onDidCreate: () => ({ dispose: () => {} }), onDidChange: () => ({ dispose: () => {} }), onDidDelete: () => ({ dispose: () => {} }), dispose: () => {} }),
+        applyEdit: async () => true
       },
       window: {
         terminals: [],
@@ -54,7 +60,8 @@ Module.prototype.require = function (id) {
         showErrorMessage: () => Promise.resolve()
       },
       Uri: {
-        file: (f) => ({ fsPath: f, scheme: "file" }),
+        file: (f) => ({ fsPath: f, scheme: "file", toString: () => `file://${f}` }),
+        joinPath: (base, ...parts) => ({ fsPath: [base.fsPath, ...parts].join("/").replace(/\/+/g, "/"), scheme: "file", toString() { return `file://${this.fsPath}`; } }),
         parse: (u) => ({ toString: () => u })
       },
       commands: {
@@ -69,6 +76,18 @@ Module.prototype.require = function (id) {
                 location: {
                   uri: { fsPath: "/workspace/src/auth.ts" },
                   range: { start: { line: 10, character: 0 } }
+                }
+              }
+            ];
+          }
+          if (cmd === "vscode.executeDocumentSymbolProvider") {
+            return [
+              {
+                name: "AuthService",
+                kind: 4, // Class
+                range: {
+                  start: { line: 0, character: 0 },
+                  end: { line: 0, character: 27 }
                 }
               }
             ];
@@ -98,6 +117,22 @@ Module.prototype.require = function (id) {
         },
         registerNewSymbolNamesProvider: () => ({ dispose: () => {} })
       },
+      tasks: { registerTaskProvider: () => ({ dispose: () => {} }) },
+      Task: class { constructor(definition, scope, name, source, execution) { this.definition = definition; this.scope = scope; this.name = name; this.source = source; this.execution = execution; } },
+      ShellExecution: class { constructor(command) { this.commandLine = command; } },
+      TaskGroup: { Build: { id: "build" }, Test: { id: "test" } },
+      tests: {
+        createTestController: () => ({
+          items: { add: () => {}, replace: () => {} },
+          createTestItem: (id, label, uri) => ({ id, label, uri, children: { add: () => {} } }),
+          createRunProfile: () => ({}),
+          createTestRun: () => ({ enqueued: () => {}, passed: () => {}, failed: () => {}, skipped: () => {}, end: () => {} }),
+          dispose: () => {}
+        })
+      },
+      TestRunProfileKind: { Run: 1, Debug: 2 },
+      TestMessage: class { constructor(message) { this.message = message; } },
+      FileType: { File: 1, Directory: 2 },
       SymbolKind: {
         File: 0,
         Module: 1,

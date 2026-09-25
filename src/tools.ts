@@ -14,17 +14,43 @@ import {
   matchesDepth,
   normalizeWorkspaceRelativePath,
   readTextFile,
-  requireWorkspaceFolder,
   resolveWorkspaceUri,
   isSubpath
 } from "./workspaceUtils";
 import { captureWriteBackup } from "./writeBackup";
+import { ChangeSetManager, getChangeSetManager } from "./changeSet/changeSetManager";
+import { getTerminalManager } from "./terminal/terminalManager";
+import { getSelfRepairPipeline } from "./changeSet/selfRepair";
+import { applyChangeSetTool } from "./changeSet/changeSetTools";
 import { logInfo } from "./logger";
 import { ripgrepSearch } from "./ripgrepSearch";
-import { ApprovalManager } from "./approvalManager";
 import { safeParseJsonToolInput } from "./toolCallParser";
 import { McpManager, McpServerConfig } from "./mcpManager";
 import { MemoryManager } from "./memoryManager";
+import { getWorkspaceCodeIndex } from "./codeIndex/workspaceCodeIndex";
+import {
+  findSymbolTool,
+  findDefinitionTool,
+  findReferencesTool,
+  findImplementationsTool,
+  getHoverTool,
+  getDocumentSymbolsTool,
+  getCallHierarchyTool,
+  renameSymbolTool
+} from "./symbolIntelligence";
+import {
+  buildCodeGraphTools,
+  getRelatedFilesTool,
+  getSymbolDependenciesTool,
+  getSymbolDependentsTool
+} from "./codeIndex/codeGraphTools";
+import {
+  createPlanTool,
+  delegateSearchTool,
+  getPlanTool,
+  updatePlanStepTool,
+  verifyChangesTool
+} from "./agent/agentTools";
 
 const DANGEROUS_COMMAND_PATTERNS = [
   /\brm\s+-rf\b/i,
@@ -43,10 +69,16 @@ export function buildToolDefinitions(opts: { enableShellTool: boolean; mcpTools?
   const tools: ToolDefinition[] = [
     {
       name: "read_file",
-      description: "Read the full text content of a file in the current workspace. Path must be relative to the workspace root.",
+      description:
+        "Read the text content of a file in the workspace. For large files or specific functions/handlers, " +
+        "specify start_line and end_line (1-indexed) to inspect that exact range. Path must be relative to the workspace root.",
       input_schema: {
         type: "object",
-        properties: { path: { type: "string", description: "Workspace-relative file path" } },
+        properties: {
+          path: { type: "string", description: "Workspace-relative file path" },
+          start_line: { type: "number", description: "Optional 1-based start line number to begin reading from." },
+          end_line: { type: "number", description: "Optional 1-based end line number to stop reading at." }
+        },
         required: ["path"]
       }
     },
@@ -151,6 +183,19 @@ export function buildToolDefinitions(opts: { enableShellTool: boolean; mcpTools?
       }
     },
     {
+      name: "find_symbol",
+      description: "Find workspace symbols by name using the VS Code language service. Prefer this over text search for classes, functions, methods, and interfaces.",
+      input_schema: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+          maxResults: { type: "number", minimum: 1, maximum: 50 }
+        },
+        required: ["query"]
+      }
+    },
+    ...buildPositionToolDefinitions(),
+    {
       name: "get_diagnostics",
       description: "Retrieve active compiler errors, type errors, linter diagnostics, and syntax warnings from the workspace Problems tab.",
       input_schema: {
@@ -186,6 +231,65 @@ export function buildToolDefinitions(opts: { enableShellTool: boolean; mcpTools?
       }
     },
     {
+      name: "apply_changeset",
+      description: "Apply related file creates, edits, and deletes atomically with conflict detection, rollback, and verification.",
+      input_schema: {
+        type: "object",
+        properties: {
+          description: { type: "string" },
+          changes: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                path: { type: "string" },
+                type: { type: "string", enum: ["create", "edit", "delete"] },
+                content: { type: "string" },
+                expectedHash: { type: "string" }
+              },
+              required: ["path", "type"]
+            }
+          }
+        },
+        required: ["changes"]
+      }
+    },
+    {
+      name: "create_plan",
+      description: "Create and persist a structured plan for a multi-step goal.",
+      input_schema: { type: "object", properties: { goal: { type: "string" }, context: { type: "string" } }, required: ["goal"] }
+    },
+    {
+      name: "get_plan",
+      description: "Read the active structured plan and its step statuses.",
+      input_schema: { type: "object", properties: {} }
+    },
+    {
+      name: "update_plan_step",
+      description: "Update a plan step or create a revision from execution feedback.",
+      input_schema: {
+        type: "object",
+        properties: {
+          stepId: { type: "string" },
+          status: { type: "string", enum: ["pending", "in_progress", "completed", "failed"] },
+          result: { type: "string" },
+          error: { type: "string" },
+          feedback: { type: "string" }
+        },
+        required: ["stepId"]
+      }
+    },
+    {
+      name: "delegate_search",
+      description: "Search the indexed workspace using an isolated, project-aware search agent.",
+      input_schema: { type: "object", properties: { query: { type: "string" }, scope: { type: "string" }, maxResults: { type: "number", minimum: 1, maximum: 50 } }, required: ["query"] }
+    },
+    {
+      name: "verify_changes",
+      description: "Run diagnostics and the detected test command for changed workspace files.",
+      input_schema: { type: "object", properties: { files: { type: "array", items: { type: "string" } } }, required: ["files"] }
+    },
+    {
       name: "task_complete",
       description:
         "Signal that an agent task is fully complete after all requested work, verification, and task-list items are finished. Call this alone, after a concise final summary.",
@@ -195,6 +299,25 @@ export function buildToolDefinitions(opts: { enableShellTool: boolean; mcpTools?
       }
     }
   ];
+
+  tools.push(...buildCodeGraphTools());
+
+  if (vscode.workspace.getConfiguration("hooshyar.experimental").get<boolean>("semanticSearch", true)) {
+    tools.push({
+      name: "semantic_search",
+      description: "Search indexed code by meaning, lexical overlap, symbols, recency, and active-file context. Works without an embedding provider using hybrid fallback.",
+      input_schema: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+          maxResults: { type: "number", minimum: 1, maximum: 50 },
+          paths: { type: "array", items: { type: "string" } },
+          language: { type: "string" }
+        },
+        required: ["query"]
+      }
+    });
+  }
 
   if (opts.enableShellTool) {
     const envInfo = getEnvironmentPlatformInfo();
@@ -253,6 +376,24 @@ export function buildToolDefinitions(opts: { enableShellTool: boolean; mcpTools?
   return tools;
 }
 
+function buildPositionToolDefinitions(): ToolDefinition[] {
+  const positionProperties = {
+    path: { type: "string", description: "Workspace-relative file path" },
+    line: { type: "number", description: "One-based line number" },
+    character: { type: "number", description: "One-based character number" },
+    symbol: { type: "string", description: "Symbol name used when path is omitted" }
+  };
+  return [
+    { name: "find_definition", description: "Find the definition of a symbol through the VS Code language service.", input_schema: { type: "object", properties: positionProperties } },
+    { name: "find_references", description: "Find references to a symbol through the VS Code language service.", input_schema: { type: "object", properties: { ...positionProperties, includeDeclaration: { type: "boolean" } } } },
+    { name: "find_implementations", description: "Find implementations of an interface, class, or method through the VS Code language service.", input_schema: { type: "object", properties: positionProperties } },
+    { name: "get_hover", description: "Get type and documentation hover information for a symbol.", input_schema: { type: "object", properties: positionProperties } },
+    { name: "get_document_symbols", description: "Get the hierarchical symbols declared in a workspace document.", input_schema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } },
+    { name: "get_call_hierarchy", description: "Get incoming or outgoing calls for a symbol.", input_schema: { type: "object", properties: { ...positionProperties, direction: { type: "string", enum: ["incoming", "outgoing"] } } } },
+    { name: "rename_symbol", description: "Rename a symbol safely across the workspace using the VS Code language service.", input_schema: { type: "object", properties: { ...positionProperties, newName: { type: "string" } }, required: ["newName"] } }
+  ];
+}
+
 async function getIgnoreMatcher(folder: vscode.WorkspaceFolder): Promise<{ isIgnored: (p: string) => boolean }> {
   const cfg = vscode.workspace.getConfiguration("hooshyar");
   if (!cfg.get<boolean>("respectIgnoreFiles", true)) {
@@ -261,7 +402,15 @@ async function getIgnoreMatcher(folder: vscode.WorkspaceFolder): Promise<{ isIgn
   return IgnoreMatcher.forWorkspace(folder);
 }
 
-export async function readFileTool(input: { path?: string }): Promise<string> {
+export async function readFileTool(input: {
+  path?: string;
+  start_line?: number;
+  end_line?: number;
+  line_start?: number;
+  line_end?: number;
+  startLine?: number;
+  endLine?: number;
+}): Promise<string> {
   const targetPath = typeof input?.path === "string" ? input.path.trim() : "";
   if (!targetPath) {
     throw new Error("read_file requires a non-empty 'path'.");
@@ -271,7 +420,41 @@ export async function readFileTool(input: { path?: string }): Promise<string> {
   if (ignore.isIgnored(relPath)) {
     throw new Error(`Path is ignored by .gitignore/.cursorignore: ${relPath}`);
   }
-  return readTextFile(uri);
+  const fullText = await readTextFile(uri);
+
+  const rawStart = input.start_line ?? input.line_start ?? input.startLine;
+  const rawEnd = input.end_line ?? input.line_end ?? input.endLine;
+  const hasRange = rawStart !== undefined || rawEnd !== undefined;
+
+  const lines = fullText.split(/\r?\n/);
+  const totalLines = lines.length;
+
+  if (hasRange) {
+    const start = Math.max(1, typeof rawStart === "number" ? Math.floor(rawStart) : 1);
+    const end = Math.min(totalLines, typeof rawEnd === "number" ? Math.max(start, Math.floor(rawEnd)) : totalLines);
+
+    if (start > totalLines) {
+      return `File '${relPath}' has ${totalLines} lines. Requested start_line ${start} is beyond end of file.`;
+    }
+    const selected = lines.slice(start - 1, end);
+    return (
+      `=== File: ${relPath} (Lines ${start} to ${end} of ${totalLines}) ===\n` +
+      selected.join("\n")
+    );
+  }
+
+  // If no range specified and file is large (> 400 lines), return first 350 lines with pagination instructions
+  const MAX_DEFAULT_LINES = 400;
+  if (totalLines > MAX_DEFAULT_LINES) {
+    const selected = lines.slice(0, 350);
+    return (
+      `=== File: ${relPath} (Showing lines 1 to 350 of ${totalLines}) ===\n` +
+      selected.join("\n") +
+      `\n\n[File truncated: showing lines 1-350 of ${totalLines}. To read subsequent sections or specific handlers, call read_file with start_line and end_line, e.g. {"path": "${relPath}", "start_line": 351, "end_line": ${Math.min(700, totalLines)}}]`
+    );
+  }
+
+  return fullText;
 }
 
 export async function writeFileTool(input: { path?: unknown; content?: unknown }): Promise<string> {
@@ -299,15 +482,13 @@ export async function writeFileTool(input: { path?: unknown; content?: unknown }
   }
 
   const { uri } = resolveWorkspaceUri(filePath);
+  let oldContent: string | undefined;
 
-  // Check if file exists (new file vs. existing file)
-  let isNewFile = false;
-  let existingSize = 0;
+  // Check existing content before allowing a full-file write.
   try {
     const existingBytes = await vscode.workspace.fs.readFile(uri);
     const existingText = Buffer.from(existingBytes).toString("utf-8");
-    existingSize = existingText.length;
-    
+    oldContent = existingText;
     // Safety guard: prevent accidentally wiping out an existing file with a partial snippet
     if (existingText.trim().length > 100 && content.length < existingText.length * 0.4) {
       throw new Error(
@@ -319,36 +500,37 @@ export async function writeFileTool(input: { path?: unknown; content?: unknown }
     if (err.message && err.message.includes("Refusing to overwrite")) {
       throw err;
     }
-    // File doesn't exist or is not readable yet, which is expected for new files
-    isNewFile = true;
-  }
-
-  // Check auto-approve logic
-  const activeEditor = vscode.window.activeTextEditor;
-  const activeFilePath = activeEditor?.document.uri.fsPath;
-  const contentSize = Buffer.byteLength(content, "utf-8");
-  
-  const approvalDecision = ApprovalManager.shouldAutoApproveWrite(
-    filePath,
-    contentSize,
-    isNewFile,
-    activeFilePath
-  );
-
-  if (approvalDecision.shouldAutoApprove) {
-    logInfo(`Auto-approved write_file: ${filePath} - ${approvalDecision.reason}`);
+    // File doesn't exist or is not readable yet, which is expected for new files.
   }
 
   await captureWriteBackup(filePath);
-  const dir = vscode.Uri.file(path.dirname(uri.fsPath));
-  await vscode.workspace.fs.createDirectory(dir);
-  await vscode.workspace.fs.writeFile(uri, Buffer.from(content, "utf-8"));
+  const changeSetId = await applyTransactionalFileChange({
+    path: filePath,
+    type: oldContent === undefined ? "create" : "edit",
+    content,
+    oldContent,
+    hash: oldContent === undefined ? "" : ChangeSetManager.hashContent(oldContent)
+  }, `write ${filePath}`);
   logInfo(`write_file: ${filePath} (${content.length} chars)`);
-  
-  const status = approvalDecision.shouldAutoApprove 
-    ? ` [auto-approved: ${approvalDecision.reason}]`
-    : "";
-  return `Wrote ${content.length} characters to ${filePath}${status}`;
+  return `Wrote ${content.length} characters to ${filePath} (${changeSetId})`;
+}
+
+async function applyTransactionalFileChange(
+  change: { path: string; type: "create" | "edit" | "delete"; content?: string; oldContent?: string; hash: string },
+  description: string
+): Promise<string> {
+  const manager = getChangeSetManager();
+  const id = manager.createChangeSet(description);
+  manager.addChange(change, id);
+  if (!await manager.apply(id)) {
+    const state = manager.getChangeSet(id)?.state;
+    throw new Error(`ChangeSet '${description}' was not applied (${state ?? "unknown"}).`);
+  }
+  const repair = await getSelfRepairPipeline().verifyAndRepair(id);
+  if (!repair.success) {
+    logInfo(`ChangeSet ${id} requires manual follow-up after verification.`);
+  }
+  return id;
 }
 
 export function findFuzzyLineMatch(fileLines: string[], targetLines: string[]): number {
@@ -399,16 +581,28 @@ export function applySearchReplace(
   const normalizedOld = oldString.replace(/\r\n/g, "\n");
   const normalizedNew = newString.replace(/\r\n/g, "\n");
 
+  const countOccurrences = (haystack: string, needle: string) => haystack.split(needle).length - 1;
+
   // 1. Direct match on raw text
   if (rawText.includes(oldString)) {
-    const count = rawText.split(oldString).length - 1;
+    const count = countOccurrences(rawText, oldString);
+    if (count > 1 && !replaceAll) {
+      throw new Error(
+        `Found ${count} occurrences of 'old_string' in the file. Please provide more surrounding lines of context to uniquely identify which section to replace, or set replace_all: true.`
+      );
+    }
     const updated = replaceAll ? rawText.split(oldString).join(newString) : rawText.replace(oldString, newString);
     return { updatedText: updated, count: replaceAll ? count : 1 };
   }
 
   // 2. Normalized LF match
   if (normalizedFileText.includes(normalizedOld)) {
-    const count = normalizedFileText.split(normalizedOld).length - 1;
+    const count = countOccurrences(normalizedFileText, normalizedOld);
+    if (count > 1 && !replaceAll) {
+      throw new Error(
+        `Found ${count} occurrences of 'old_string' in the file. Please provide more surrounding lines of context to uniquely identify which section to replace, or set replace_all: true.`
+      );
+    }
     let updated = replaceAll
       ? normalizedFileText.split(normalizedOld).join(normalizedNew)
       : normalizedFileText.replace(normalizedOld, normalizedNew);
@@ -437,7 +631,12 @@ export function applySearchReplace(
   // 4. Trimmed block match (handles cases where old_string has extra leading/trailing blank lines)
   const trimmedOld = normalizedOld.trim();
   if (trimmedOld.length > 0 && normalizedFileText.includes(trimmedOld)) {
-    const occurrences = normalizedFileText.split(trimmedOld).length - 1;
+    const occurrences = countOccurrences(normalizedFileText, trimmedOld);
+    if (occurrences > 1 && !replaceAll) {
+      throw new Error(
+        `Found ${occurrences} occurrences of trimmed 'old_string'. Please include more surrounding context lines.`
+      );
+    }
     if (occurrences === 1 || replaceAll) {
       const updated = replaceAll
         ? normalizedFileText.split(trimmedOld).join(normalizedNew.trim())
@@ -447,8 +646,30 @@ export function applySearchReplace(
     }
   }
 
+  // 5. Line-numbers stripped fallback (in case model copied line numbers like "12: const x = ...")
+  const stripLineNumbers = (text: string) =>
+    text.split("\n").map((line) => line.replace(/^\s*\d+[:|]\s?/, "")).join("\n");
+
+  const strippedOld = stripLineNumbers(normalizedOld);
+  const strippedNew = stripLineNumbers(normalizedNew);
+
+  if (strippedOld !== normalizedOld && strippedOld.trim().length > 0) {
+    if (normalizedFileText.includes(strippedOld)) {
+      const count = countOccurrences(normalizedFileText, strippedOld);
+      if (count === 1 || replaceAll) {
+        let updated = replaceAll
+          ? normalizedFileText.split(strippedOld).join(strippedNew)
+          : normalizedFileText.replace(strippedOld, strippedNew);
+        if (isCrlf && !updated.includes("\r\n")) {
+          updated = updated.replace(/\n/g, "\r\n");
+        }
+        return { updatedText: updated, count: replaceAll ? count : 1 };
+      }
+    }
+  }
+
   throw new Error(
-    `old_string not found in file. Please ensure lines match the file (you can use read_file first to see current lines and indentation).`
+    `old_string not found in file. Please ensure lines match the file (you can use read_file with start_line/end_line to see current lines and indentation).`
   );
 }
 
@@ -468,31 +689,17 @@ export async function searchReplaceTool(input: {
 
   const { updatedText, count } = applySearchReplace(rawText, input.old_string, input.new_string, Boolean(input.replace_all));
 
-  // Check auto-approve logic for edits
-  const activeEditor = vscode.window.activeTextEditor;
-  const activeFilePath = activeEditor?.document.uri.fsPath;
-  const contentSize = Buffer.byteLength(updatedText, "utf-8");
-  
-  const approvalDecision = ApprovalManager.shouldAutoApproveWrite(
-    filePath,
-    contentSize,
-    false, // search_replace is always on existing files
-    activeFilePath
-  );
-
-  if (approvalDecision.shouldAutoApprove) {
-    logInfo(`Auto-approved search_replace: ${filePath} - ${approvalDecision.reason}`);
-  }
-
   await captureWriteBackup(filePath);
-  await vscode.workspace.fs.writeFile(uri, Buffer.from(updatedText, "utf-8"));
+  const changeSetId = await applyTransactionalFileChange({
+    path: filePath,
+    type: "edit",
+    content: updatedText,
+    oldContent: rawText,
+    hash: ChangeSetManager.hashContent(rawText)
+  }, `edit ${filePath}`);
   const replaced = input.replace_all ? count : 1;
   logInfo(`search_replace: ${filePath} (${replaced} replacement(s))`);
-  
-  const status = approvalDecision.shouldAutoApprove 
-    ? ` [auto-approved: ${approvalDecision.reason}]`
-    : "";
-  return `Successfully replaced ${replaced} occurrence(s) in ${filePath}${status}`;
+  return `Successfully replaced ${replaced} occurrence(s) in ${filePath} (${changeSetId})`;
 }
 
 export async function listFilesTool(input: { path?: string }): Promise<string> {
@@ -664,27 +871,36 @@ export async function searchCodebaseTool(
 
 export function assertSafeCommand(command: string): void {
   const trimmed = command.trim();
+  // Strip quoted strings ('...' and "...") so semicolons, pipes, and operators inside literals are ignored
+  const withoutQuotes = trimmed.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, '""');
   // Allow safe sequential chaining with "&&" by temporarily removing it for the operator check
-  const withoutSafeAnd = trimmed.replace(/\s*&&\s*/g, " ");
+  const withoutSafeAnd = withoutQuotes.replace(/\s*&&\s*/g, " ");
   // Block dangerous command substitution like $(...) or `...`, backgrounding single & or pipes, and semicolon chaining
-  if (/[;|`]/.test(withoutSafeAnd) || /\$\(/.test(withoutSafeAnd) || /(?<!&)&(?!&)/.test(trimmed)) {
+  if (/[;|`]/.test(withoutSafeAnd) || /\$\(/.test(withoutSafeAnd) || /(?<!&)&(?!&)/.test(withoutQuotes)) {
     throw new Error(
       "Command chaining or shell operators (; | ` $( or single &) are not permitted for safety reasons. You may use && for chaining."
     );
   }
-  const cfg = vscode.workspace?.getConfiguration ? vscode.workspace.getConfiguration("hooshyar") : undefined;
-  const allowed = cfg ? cfg.get<string[]>("allowedShellCommands", []) : [];
-  if (allowed.length > 0) {
-    const ok = allowed.some((prefix) => trimmed.startsWith(prefix));
-    if (!ok) {
-      throw new Error(
-        `Command not allowed. It must start with one of: ${allowed.join(", ")}`
-      );
-    }
-  }
   for (const pattern of DANGEROUS_COMMAND_PATTERNS) {
     if (pattern.test(trimmed)) {
       throw new Error("Command blocked by Hooshyar safety policy.");
+    }
+  }
+  const cfg = vscode.workspace?.getConfiguration ? vscode.workspace.getConfiguration("hooshyar") : undefined;
+  const allowed = cfg ? cfg.get<string[]>("allowedShellCommands", []) : [];
+  if (allowed.length > 0) {
+    const segments = trimmed.split(/\s*&&\s*/);
+    for (const seg of segments) {
+      const segTrimmed = seg.trim();
+      if (!segTrimmed) continue;
+      const ok = allowed.some((prefix) =>
+        segTrimmed.toLowerCase().startsWith(prefix.toLowerCase())
+      );
+      if (!ok) {
+        throw new Error(
+          `Command not allowed. It must start with one of: ${allowed.join(", ")}`
+        );
+      }
     }
   }
 }
@@ -776,6 +992,14 @@ export function runCommandTool(input: { command: string; path?: string; timeout_
 
   const envInfo = getEnvironmentPlatformInfo();
   const timeoutMs = resolveCommandTimeoutMs(input.timeout_ms);
+  let cmdToExec = normalizedCommand;
+  if (envInfo.isWindows && envInfo.shellFamily === "powershell" && envInfo.shell === "powershell") {
+    const segments = cmdToExec.split(/\s*&&\s*/);
+    if (segments.length > 1) {
+      cmdToExec = segments.join("; if ($?) { ") + " }".repeat(segments.length - 1);
+    }
+  }
+
   const execOptions: any = {
     cwd: root,
     timeout: timeoutMs,
@@ -797,7 +1021,7 @@ export function runCommandTool(input: { command: string; path?: string; timeout_
       else resolve(result || "Exit code: 0\nSTDOUT:\n(no output)\nSTDERR:\n(no output)");
     };
 
-    const child = exec(normalizedCommand, execOptions, (err, stdout, stderr) => {
+    const child = exec(cmdToExec, execOptions, (err, stdout, stderr) => {
       if (signal?.aborted) {
         finish(new Error("Command cancelled by user."));
         return;
@@ -820,9 +1044,11 @@ export function runCommandTool(input: { command: string; path?: string; timeout_
             try {
               process.kill(-child.pid, "SIGKILL");
             } catch {
-              try {
-                child.kill("SIGKILL");
-              } catch {}
+            try {
+              child.kill("SIGKILL");
+              } catch {
+                // The process may already have exited between the PID check and kill.
+              }
             }
           }
         }
@@ -851,18 +1077,8 @@ export function runInTerminalTool(input: { command: string; path?: string }): Pr
   }
 
   const termName = "Hooshyar Terminal";
-  let existingTerm = (vscode.window.terminals || []).find((t: any) => t.name === termName);
-  let term = existingTerm;
-  if (!term) {
-    term = vscode.window.createTerminal({
-      name: termName,
-      cwd: targetCwd
-    });
-  } else if (targetCwd) {
-    term.sendText(`cd "${targetCwd}"`, true);
-  }
-  term.show(true);
-  term.sendText(normalizedCmd, true);
+  const terminalManager = getTerminalManager();
+  terminalManager.executeInTerminal(termName, normalizedCmd, { cwd: targetCwd, show: true });
   return Promise.resolve(`Successfully sent command to Hooshyar Terminal: ${normalizedCmd}`);
 }
 
@@ -954,6 +1170,17 @@ export function normalizeToolInput(
   if (name === "run_command") {
     const rawTimeout = rawObj.timeout_ms ?? rawObj.timeoutMs ?? rawObj.timeout;
     if (rawTimeout !== undefined) norm.timeout_ms = Number(rawTimeout);
+  }
+
+  if (name === "read_file") {
+    const rawStart = rawObj?.start_line ?? rawObj?.startLine ?? rawObj?.line_start ?? rawObj?.lineStart ?? rawObj?.offset;
+    if (rawStart !== undefined && !isNaN(Number(rawStart))) {
+      norm.start_line = Math.max(1, Math.floor(Number(rawStart)));
+    }
+    const rawEnd = rawObj?.end_line ?? rawObj?.endLine ?? rawObj?.line_end ?? rawObj?.lineEnd ?? rawObj?.limit;
+    if (rawEnd !== undefined && !isNaN(Number(rawEnd))) {
+      norm.end_line = Math.max(1, Math.floor(Number(rawEnd)));
+    }
   }
 
   // 2. search_replace normalization
@@ -1249,6 +1476,46 @@ export async function executeTool(
     }
     case "get_workspace_symbols":
       return getWorkspaceSymbolsTool(input as any);
+    case "find_symbol":
+      return findSymbolTool(input as any);
+    case "find_definition":
+      return findDefinitionTool(input as any);
+    case "find_references":
+      return findReferencesTool(input as any);
+    case "find_implementations":
+      return findImplementationsTool(input as any);
+    case "get_hover":
+      return getHoverTool(input as any);
+    case "get_document_symbols":
+      return getDocumentSymbolsTool(input as any);
+    case "get_call_hierarchy":
+      return getCallHierarchyTool(input as any);
+    case "rename_symbol":
+      return renameSymbolTool(input as any);
+    case "get_related_files":
+      return getRelatedFilesTool(input as any);
+    case "get_symbol_dependencies":
+      return getSymbolDependenciesTool(input as any);
+    case "get_symbol_dependents":
+      return getSymbolDependentsTool(input as any);
+    case "apply_changeset":
+      return applyChangeSetTool(input as any);
+    case "create_plan":
+      return createPlanTool(input as any);
+    case "get_plan":
+      return getPlanTool();
+    case "update_plan_step":
+      return updatePlanStepTool(input as any);
+    case "delegate_search":
+      return delegateSearchTool(input as any);
+    case "verify_changes":
+      return verifyChangesTool(input as any);
+    case "semantic_search": {
+      const query = typeof input.query === "string" ? input.query.trim() : "";
+      if (!query) throw new Error("semantic_search requires 'query'.");
+      const results = await getWorkspaceCodeIndex().search(input as any, ctx.signal);
+      return JSON.stringify({ results }, null, 2);
+    }
     case "get_diagnostics":
       return getDiagnosticsTool(input as any);
     case "fetch_webpage":
@@ -1286,7 +1553,7 @@ export function isMcpMutatingTool(name: string): boolean {
 }
 
 export function isMutatingTool(name: string): boolean {
-  if (name === "write_file" || name === "search_replace" || name === "run_command" || name === "run_in_terminal") return true;
+  if (name === "write_file" || name === "search_replace" || name === "rename_symbol" || name === "run_command" || name === "run_in_terminal" || name === "apply_changeset" || name === "create_plan" || name === "update_plan_step" || name === "verify_changes") return true;
   if (name.startsWith("mcp_")) return isMcpMutatingTool(name);
   return false;
 }
@@ -1296,7 +1563,20 @@ export function isParallelSafeTool(name: string): boolean {
     name === "read_file" ||
     name === "list_files" ||
     name === "search_codebase" ||
+    name === "semantic_search" ||
+    name === "delegate_search" ||
+    name === "get_plan" ||
     name === "get_workspace_symbols" ||
+    name === "find_symbol" ||
+    name === "find_definition" ||
+    name === "find_references" ||
+    name === "find_implementations" ||
+    name === "get_hover" ||
+    name === "get_document_symbols" ||
+    name === "get_call_hierarchy" ||
+    name === "get_related_files" ||
+    name === "get_symbol_dependencies" ||
+    name === "get_symbol_dependents" ||
     name === "get_diagnostics" ||
     name === "fetch_webpage"
   );

@@ -2,8 +2,9 @@ import * as vscode from "vscode";
 import { readTextFile, resolveWorkspaceUri } from "./workspaceUtils";
 import { getWorkspaceFileIndex } from "./workspaceIndex";
 import { listWorkspaceRootsSummary } from "./tools";
+import { getGitDiff } from "./gitCommitGenerator";
 
-const MENTION_RE = /@([\w./@-]+)/g;
+const MENTION_RE = /(?:@|#)([\w./@:-]+)/g;
 
 export function extractMentions(text: string): string[] {
   const found = new Set<string>();
@@ -36,6 +37,32 @@ export async function resolveMentionsToContext(text: string): Promise<string> {
       continue;
     }
 
+    if (mention === "editor" || mention === "file") {
+      const editor = vscode.window.activeTextEditor;
+      if (editor) parts.push(`[${mention}]\nFile: ${vscode.workspace.asRelativePath(editor.document.uri, false)}\n\`\`\`\n${editor.document.getText().slice(0, 20_000)}\n\`\`\``);
+      continue;
+    }
+
+    if (mention === "problems") {
+      const diagnostics = vscode.languages.getDiagnostics().flatMap(([uri, items]) => items.map((item) =>
+        `${vscode.workspace.asRelativePath(uri, false)}:${item.range.start.line + 1} ${item.message}`));
+      parts.push(`[#problems]\n${diagnostics.slice(0, 100).join("\n") || "No workspace diagnostics."}`);
+      continue;
+    }
+
+    if (mention === "git") {
+      const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (root) parts.push(`[#git]\n${(await getGitDiff(root, false)).slice(0, 20_000) || "No working tree changes."}`);
+      continue;
+    }
+
+    if (mention === "codebase" || mention === "tests") {
+      const index = await getWorkspaceFileIndex();
+      const files = mention === "tests" ? index.filter((file) => /(?:test|spec)/i.test(file.path)) : index;
+      parts.push(`[#${mention}]\n${files.slice(0, 200).map((file) => file.path).join("\n") || "No matching files."}`);
+      continue;
+    }
+
     const normalized = mention.replace(/^@/, "");
     try {
       const { uri } = resolveWorkspaceUri(normalized);
@@ -62,5 +89,5 @@ export async function resolveMentionsToContext(text: string): Promise<string> {
 }
 
 export function stripMentionMarkers(text: string): string {
-  return text.replace(MENTION_RE, (_all, name: string) => `@${name}`);
+  return text.replace(MENTION_RE, (all: string, name: string) => `${all[0]}${name}`);
 }

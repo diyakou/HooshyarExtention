@@ -57,10 +57,14 @@ export class SessionManager {
           .join("\n");
       }
       if (!t.trim()) continue;
+      if (/^\s*\[SYSTEM:/i.test(t)) continue;
+      const requestMarker = "[hooshyar_user_request]";
+      const requestIndex = t.lastIndexOf(requestMarker);
+      if (requestIndex >= 0) t = t.slice(requestIndex + requestMarker.length);
       const marker = "---\n\n";
       const idx = t.lastIndexOf(marker);
       if (idx >= 0) t = t.slice(idx + marker.length);
-      t = t.replace(/\s+/g, " ").trim();
+      t = t.replace(/<[^>]*>/g, " ").replace(/&(?:nbsp|#x20);/gi, " ").replace(/\s+/g, " ").trim();
       if (t) return t.slice(0, 60);
     }
     return "New chat";

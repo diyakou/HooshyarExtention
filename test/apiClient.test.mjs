@@ -1,9 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { parseRetryAfterDelayMs } from "../out/apiClient.js";
+import { normalizeModelsUrl } from "../out/apiConfig.js";
 import { buildRequestHeaders, readInlineApiConfig } from "../out/apiConfig.js";
 
 test("API Client Resilience Tests", async (t) => {
+  await t.test("normalizeModelsUrl targets v1/models from supported base URL forms", () => {
+    assert.equal(normalizeModelsUrl("https://api.example.com/v1"), "https://api.example.com/v1/models");
+    assert.equal(normalizeModelsUrl("https://api.example.com/v1/messages"), "https://api.example.com/v1/models");
+    assert.equal(normalizeModelsUrl("https://api.example.com/v1/chat/completions"), "https://api.example.com/v1/models");
+  });
   await t.test("parseRetryAfterDelayMs parses integer seconds correctly", () => {
     const delay = parseRetryAfterDelayMs("5", 1000);
     assert.equal(delay, 5000);

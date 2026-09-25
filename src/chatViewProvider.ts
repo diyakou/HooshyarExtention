@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import { ApiClient } from "./apiClient";
-import { readApiClientConfig, ToolProtocol } from "./apiConfig";
+import { fetchAvailableModels, readApiClientConfig, ToolProtocol } from "./apiConfig";
 import { buildUserContent, imageToDataUrl, isImagePath, isLikelyTextFile, readImageAttachment } from "./attachments";
 import {
   trimHistoryForContext,
@@ -31,25 +31,22 @@ import {
   extractTextualToolCalls,
   flattenToolHistoryForApi,
   truncateToolOutput,
-  userWantsFileWrite,
   userWantsFileEdit,
   userWantsNewFile,
   safeParseJsonToolInput,
   inferFilePath
 } from "./toolCallParser";
-import {
-  buildToolDefinitions,
-  executeTool,
-  isMutatingTool,
-  isParallelSafeTool,
-  applySearchReplace,
-  normalizeCommandForHost,
-  normalizeToolInput
-} from "./tools";
+import { normalizeCommandForHost, normalizeToolInput } from "./tools";
+import { createAgentToolRegistry } from "./tools/createRegistry";
+import { ApprovalEngine } from "./approvalEngine";
+import { AgentState, AgentStateMachine } from "./agent/agentState";
+import { detectModelCapabilities } from "./modelCapabilities";
+import { ContextEngine } from "./context/contextEngine";
 import { McpManager, McpServerConfig, readMcpServers, parseMcpServersWithValidation, loadWorkspaceMcpConfig } from "./mcpManager";
+import { FigmaAuthManager, FIGMA_REMOTE_MCP_URL, FIGMA_DESKTOP_MCP_URL } from "./figmaAuthManager";
 import { resolveWorkspaceUri, readTextFile, isSubpath, normalizeFsPath } from "./workspaceUtils";
-import { ApprovalManager } from "./approvalManager";
 import { ReviewManager } from "./reviewManager";
+import { MemoryManager } from "./memoryManager";
 import { getGitDiff, generateCommitMessage } from "./gitCommitGenerator";
 import { isSkillReference, workspaceRelativeSkillPath } from "./skillsManager";
 import {
@@ -67,6 +64,12 @@ import {
   ChatMode,
   ToolDefinition
 } from "./types";
+
+const PLAN_SYSTEM_PROMPT_BASE =
+  "You are Hooshyar in PLAN MODE. Inspect and analyze the open workspace using read-only tools, " +
+  "then produce a concrete, ordered implementation plan. You may search, list, and read files, but " +
+  "you must never edit files, run shell commands, or perform any action that changes workspace state. " +
+  "Make assumptions and risks explicit, cite relevant file paths, and finish with an actionable checklist.";
 
 const AGENT_SYSTEM_PROMPT_BASE =
   "You are Hooshyar, an autonomous in-editor coding agent running inside VS Code. " +
@@ -115,10 +118,15 @@ const AGENT_SYSTEM_PROMPT_BASE =
   "- list_files {path}: list a directory (non-recursive). If in a multi-project workspace, path '.' lists all open project folders.\n" +
   "- list_codebase {path?, glob?, depth?}: recursively list project files across open project folders.\n" +
   "- search_codebase {pattern, path?, glob?, is_regex?, depth?}: grep-like search across open project folders.\n" +
+  "- semantic_search {query, maxResults?, paths?, language?}: hybrid indexed retrieval across code meaning, text, symbols, recency, and active context.\n" +
   "- update_tasks {tasks: [{id, content, status}]}: show/update your plan checklist.\n" +
   "- run_command {command, path?}: run a shell command, test suite (e.g. 'npm test', 'npm run compile', 'pytest'), or script in the workspace root or specified directory and inspect stdout/stderr. Must be compatible with host OS.\n" +
   "- run_in_terminal {command, path?}: send an interactive command or dev server directly to the visible VS Code integrated terminal.\n" +
   "- get_workspace_symbols {query}: search for functions, classes, interfaces, methods, and variables across the entire workspace AST.\n" +
+  "- find_symbol {query}: resolve named code symbols. For definitions, usages, implementations, hover, document symbols, and call hierarchy, prefer the corresponding Language Service tools over grep.\n" +
+  "- find_definition/find_references/find_implementations/get_hover {path?, line?, character?, symbol?}: precise language-service navigation.\n" +
+  "- get_document_symbols {path} and get_call_hierarchy {...}: inspect structural code relationships.\n" +
+  "- rename_symbol {..., newName}: language-service workspace rename; this is a write operation requiring permission.\n" +
   "- get_diagnostics {path?, severity?}: read compiler errors, type errors, and linter warnings from the workspace / Problems tab.\n" +
   "- fetch_webpage {url}: fetch and read web pages, live documentation, and API references.\n" +
   "- manage_memory {action, key?, value?}: manage persistent user preferences across projects (actions: store, recall, delete, list).\n" +
@@ -168,8 +176,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private cachedSystemPrompt = AGENT_SYSTEM_PROMPT_BASE;
   private systemPromptReady: Promise<void> = Promise.resolve();
   private systemPromptRefreshVersion = 0;
+  private readonly approvalEngine = new ApprovalEngine();
+  private readonly agentState = new AgentStateMachine();
+  private readonly contextEngine = new ContextEngine();
   private mcpManager = new McpManager();
   private isCompactingContext = false;
+  private figmaAuthManager: FigmaAuthManager;
 
   public async getMcpServers(): Promise<Record<string, McpServerConfig>> {
     const cfg = vscode.workspace.getConfiguration("hooshyar");
@@ -183,8 +195,42 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return this.mcpManager;
   }
 
+  public getFigmaAuthManager(): FigmaAuthManager {
+    return this.figmaAuthManager;
+  }
+
+  public async ensureFigmaMcpConfigured(): Promise<void> {
+    const cfg = vscode.workspace.getConfiguration("hooshyar");
+    const rawMcp = cfg.get<unknown>("mcpServers", "{}");
+    const { servers } = parseMcpServersWithValidation(rawMcp);
+    if (!servers.figma || servers.figma.command || servers.figma.url !== FIGMA_REMOTE_MCP_URL) {
+      servers.figma = {
+        url: FIGMA_REMOTE_MCP_URL
+      };
+      await cfg.update("mcpServers", JSON.stringify(servers, null, 2), vscode.ConfigurationTarget.Global);
+    }
+  }
+
+  public async configureFigmaDesktop(): Promise<void> {
+    const cfg = vscode.workspace.getConfiguration("hooshyar");
+    const rawMcp = cfg.get<unknown>("mcpServers", "{}");
+    const { servers } = parseMcpServersWithValidation(rawMcp);
+    servers.figma = {
+      url: FIGMA_DESKTOP_MCP_URL
+    };
+    await cfg.update("mcpServers", JSON.stringify(servers, null, 2), vscode.ConfigurationTarget.Global);
+    this.openSettingsModal();
+    this.postToWebview({
+      type: "figmaAuthResult",
+      success: true,
+      message: "سرور محلی Figma Desktop با آدرس http://127.0.0.1:3845/mcp با موفقیت تنظیم شد. توجه کنید که در اپلیکیشن Figma باید Dev Mode فعال باشد.",
+      authenticated: false
+    });
+  }
+
   public dispose(): void {
     this.abortController?.abort();
+    this.figmaAuthManager.cancelPendingOAuth();
     this.mcpManager.dispose();
   }
 
@@ -193,6 +239,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly secretStorage: vscode.SecretStorage,
     private readonly memento: vscode.Memento
   ) {
+    this.figmaAuthManager = new FigmaAuthManager(secretStorage);
+    this.mcpManager.setFigmaTokenProvider(
+      () => this.figmaAuthManager.getValidAccessToken(),
+      () => this.figmaAuthManager.refreshTokens().then((t) => t?.accessToken ?? null)
+    );
     this.apiClient = new ApiClient(() => this.readConfig());
     this.sessionManager = new SessionManager(memento);
     this.currentSessionId = this.sessionManager.getCurrentId();
@@ -204,11 +255,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.currentMode = session.mode ?? "agent";
     }
     this.systemPromptReady = this.refreshSystemPrompt();
+    MemoryManager.getInstance().onDidChange(() => {
+      void this.refreshSystemPrompt();
+    });
   }
 
   private async refreshSystemPrompt(): Promise<void> {
     const refreshVersion = ++this.systemPromptRefreshVersion;
-    const base = this.currentMode === "chat" ? CHAT_SYSTEM_PROMPT_BASE : AGENT_SYSTEM_PROMPT_BASE;
+    const base = this.currentMode === "plan"
+      ? PLAN_SYSTEM_PROMPT_BASE
+      : (this.currentMode === "chat" || this.currentMode === "ask")
+        ? CHAT_SYSTEM_PROMPT_BASE
+        : AGENT_SYSTEM_PROMPT_BASE;
     const prompt = await buildSystemPrompt(base);
     if (refreshVersion === this.systemPromptRefreshVersion) {
       this.cachedSystemPrompt = prompt;
@@ -242,10 +300,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private postUsage() {
+    const maxContextChars = vscode.workspace.getConfiguration("hooshyar").get<number>("maxContextChars", 60_000);
     this.postToWebview({
       type: "usage",
       inputTokens: this.sessionUsage.input_tokens ?? 0,
-      outputTokens: this.sessionUsage.output_tokens ?? 0
+      outputTokens: this.sessionUsage.output_tokens ?? 0,
+      contextTokens: Math.ceil(historyCharLength(this.history) / 4),
+      maxContextTokens: Math.ceil(maxContextChars / 4)
     });
   }
 
@@ -258,6 +319,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return readApiClientConfig(this.cachedApiKey ?? "");
   }
 
+  private transitionAgent(next: AgentState, detail?: string): void {
+    try {
+      this.agentState.transition(next, detail);
+      logDebug(`Agent state=${next}${detail ? ` detail=${detail}` : ""}`);
+    } catch (error: any) {
+      logWarn(error?.message ?? String(error));
+    }
+  }
+
   private effectiveToolProtocol(): ToolProtocol {
     const cfg = this.readConfig().toolProtocol;
     if (cfg === "native" || cfg === "text") return cfg;
@@ -266,12 +336,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private prepareMessagesForApi(): Message[] {
     const cfg = vscode.workspace?.getConfiguration ? vscode.workspace.getConfiguration("hooshyar") : undefined;
-    const maxContext = cfg ? cfg.get<number>("maxContextChars", 60_000) : 60_000;
+    const maxContext = cfg ? cfg.get<number>("maxContextChars", 160_000) : 160_000;
     const pruneOldTools = cfg ? cfg.get<boolean>("pruneOldToolOutputs", true) : true;
     const useNative = this.effectiveToolProtocol() === "native";
     let base = useNative ? this.history : flattenToolHistoryForApi(this.history);
-    if (pruneOldTools) {
-      base = compactHistoricalToolResults(base, 1);
+    const currentChars = historyCharLength(base);
+    // Only compact older tool results if total history is approaching context limits (> 50% of budget)
+    if (pruneOldTools && currentChars > maxContext * 0.5) {
+      base = compactHistoricalToolResults(base, 4, 1200);
     }
     return trimHistoryForContext(base, maxContext);
   }
@@ -325,6 +397,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case "setMode":
           await this.setMode(msg.mode);
           break;
+        case "requestModels": {
+          const selectedModel = this.readConfig().model;
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 15_000);
+          try {
+            const models = await fetchAvailableModels(this.readConfig(), controller.signal);
+            this.postToWebview({ type: "modelsLoaded", models, selectedModel });
+          } catch (error: any) {
+            this.postToWebview({
+              type: "modelsLoaded",
+              models: [],
+              selectedModel,
+              error: error?.name === "AbortError" ? "Loading models timed out." : (error?.message ?? String(error))
+            });
+          } finally {
+            clearTimeout(timeout);
+          }
+          break;
+        }
         case "newChat":
           this.newChat();
           break;
@@ -340,6 +431,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case "openDiff":
           if (msg.path && msg.path !== "undefined" && !msg.path.includes("unspecified")) {
             await openDiffForFile(msg.path, { preserveFocus: false });
+          }
+          break;
+        case "openFile":
+          if (msg.path) {
+            const resolved = resolveWorkspaceUri(msg.path);
+            if (resolved) {
+              const document = await vscode.workspace.openTextDocument(resolved.uri);
+              const editor = await vscode.window.showTextDocument(document, { preview: true, preserveFocus: false });
+              if (typeof msg.line === "number" && msg.line > 0) {
+                const position = new vscode.Position(Math.max(0, msg.line - 1), 0);
+                editor.selection = new vscode.Selection(position, position);
+                editor.revealRange(new vscode.Range(position, position), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+              }
+            }
           }
           break;
         case "revertFile":
@@ -383,6 +488,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case "renameSession":
           this.renameSession(msg.id, msg.title);
           break;
+        case "promptRenameSession": {
+          const session = this.sessionManager.find(msg.id);
+          const currentTitle = session?.title || "";
+          const newTitle = await vscode.window.showInputBox({
+            prompt: "نام جدید گفتگو را وارد کنید / Enter new chat title",
+            value: currentTitle
+          });
+          if (newTitle !== undefined && newTitle.trim()) {
+            this.renameSession(msg.id, newTitle.trim());
+          }
+          break;
+        }
         case "retryLastTurn":
           await this.retryLastTurn();
           break;
@@ -520,6 +637,59 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           }
           break;
         }
+        case "getFigmaAuthStatus": {
+          const status = await this.figmaAuthManager.getAuthStatus();
+          this.postToWebview({
+            type: "figmaAuthStatus",
+            authenticated: status.authenticated,
+            expiresAt: status.expiresAt,
+            error: status.error
+          });
+          break;
+        }
+        case "loginFigma": {
+          this.postToWebview({
+            type: "figmaAuthResult",
+            success: false,
+            message: "در حال باز کردن مرورگر و انتظار برای تایید ورود در فیگما...",
+            authenticated: false
+          });
+          const result = await this.figmaAuthManager.startOAuthFlow();
+          if (result.success) {
+            await this.ensureFigmaMcpConfigured();
+            this.openSettingsModal();
+          }
+          this.postToWebview({
+            type: "figmaAuthResult",
+            success: result.success,
+            message: result.message,
+            authenticated: result.success
+          });
+          this.postToWebview({
+            type: "figmaAuthStatus",
+            authenticated: result.success,
+            expiresAt: result.tokens?.expiresAt
+          });
+          break;
+        }
+        case "logoutFigma": {
+          await this.figmaAuthManager.logout();
+          this.postToWebview({
+            type: "figmaAuthResult",
+            success: true,
+            message: "با موفقیت از حساب فیگما خارج شدید.",
+            authenticated: false
+          });
+          this.postToWebview({
+            type: "figmaAuthStatus",
+            authenticated: false
+          });
+          break;
+        }
+        case "configureFigmaDesktop": {
+          await this.configureFigmaDesktop();
+          break;
+        }
         case "addSkills": {
           const selectedFiles = await vscode.window.showOpenDialog({
             canSelectFiles: true,
@@ -640,17 +810,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       mcpServers: mcpServersStr
     };
     this.postToWebview({ type: "settingsLoaded", settings });
+    this.figmaAuthManager.getAuthStatus().then((status) => {
+      this.postToWebview({
+        type: "figmaAuthStatus",
+        authenticated: status.authenticated,
+        expiresAt: status.expiresAt,
+        error: status.error
+      });
+    }).catch(() => {});
     vscode.commands.executeCommand("hooshyar.chatView.focus");
   }
 
-  public async newChat() {
+  public async newChat(persist = true) {
     this.abortController?.abort();
     this.isStreaming = false;
     this.isAgentWorking = false;
     this.activeTurnText = "";
     this.pendingApprovals.clear();
     this.pendingApprovalData = undefined;
-    await this.persistCurrentSession();
+    if (persist) {
+      await this.persistCurrentSession();
+    }
     this.currentSessionId = this.sessionManager.genId();
     this.sessionManager.setCurrentId(this.currentSessionId);
     this.history = [];
@@ -708,7 +888,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const wasCurrent = id === this.currentSessionId;
     if (!this.sessionManager.deleteSession(id)) return;
     if (wasCurrent) {
-      this.newChat();
+      this.history = [];
+      this.taskList = [];
+      void this.newChat(false);
     } else {
       this.postSessions();
     }
@@ -790,6 +972,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     this.pendingApprovals.clear();
     this.pendingApprovalData = undefined;
+    this.transitionAgent("CANCELLED", "Stopped by user");
     this.postToWebview({ type: "streaming", active: false });
     this.postToWebview({ type: "agentWorking", active: false });
   }
@@ -950,33 +1133,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const rawPath = typeof call.input?.path === "string" ? call.input.path.trim() : "";
     const validPath = rawPath && rawPath !== "undefined" && rawPath !== "null" ? rawPath : "";
 
-    // 1. Check auto-approval rules first before prompting user
-    if (call.name === "run_command" || call.name === "run_in_terminal") {
-      const cmd = normalizeCommandForHost(String(call.input?.command || ""));
-      const decision = ApprovalManager.shouldAutoApproveCommand(cmd);
-      if (decision.shouldAutoApprove) {
-        logInfo(`Auto-approved ${call.name}: ${cmd} (${decision.reason || "auto"})`);
-        return true;
-      }
-    } else if (call.name === "write_file" || call.name === "search_replace") {
-      const activeEditor = vscode.window.activeTextEditor;
-      const activeFilePath = activeEditor?.document.uri.fsPath;
-      const contentSize =
-        typeof call.input?.content === "string"
-          ? Buffer.byteLength(call.input.content, "utf-8")
-          : typeof call.input?.new_string === "string"
-          ? Buffer.byteLength(call.input.new_string, "utf-8")
-          : 0;
-      const decision = ApprovalManager.shouldAutoApproveWrite(
-        validPath,
-        contentSize,
-        call.name === "write_file",
-        activeFilePath
-      );
-      if (decision.shouldAutoApprove) {
-        logInfo(`Auto-approved ${call.name}: ${validPath} (${decision.reason || "auto"})`);
-        return true;
-      }
+    const risk = call.name === "run_command" || call.name === "run_in_terminal" ? "execute" : "write";
+    const policy = this.approvalEngine.evaluate(
+      { name: call.name, risk },
+      call.input,
+      { activeEditorPath: vscode.window.activeTextEditor?.document.uri.fsPath }
+    );
+    if (policy.action === "allow") {
+      logInfo(`Auto-approved ${call.name}: ${policy.reason}`);
+      return true;
+    }
+    if (policy.action === "deny") {
+      logWarn(`Denied ${call.name}: ${policy.reason}`);
+      this.postToWebview({ type: "error", message: policy.reason });
+      return false;
     }
 
     let diffPreview: string | undefined;
@@ -1217,6 +1387,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     this.abortController?.abort();
     this.abortController = new AbortController();
+    this.transitionAgent("REQUESTING_MODEL", "User request started");
     this.isStreaming = true;
     this.isAgentWorking = false;
     this.activeTurnText = "";
@@ -1239,12 +1410,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.pendingImages = [];
     this.postAttachments();
 
-    const userContent = buildUserContent(composeUserMessage([envAndMentions, contextPrefix], text), images);
+    const contextBudget = vscode.workspace.getConfiguration("hooshyar").get<number>("contextInputBudgetTokens", 20_000);
+    const selectedContext = this.contextEngine.select(
+      [
+        { id: "environment", source: "workspace", content: envAndMentions, relevance: 1, priority: 100, essential: true },
+        { id: "attachments", source: "attachments", content: contextPrefix, relevance: 1, priority: 90 }
+      ],
+      contextBudget
+    );
+    const userContent = buildUserContent(
+      composeUserMessage(selectedContext.items.map((item) => item.content), text),
+      images
+    );
     this.history.push({ role: "user", content: userContent });
 
     logInfo(`User message (${text.length} chars${images.length ? `, ${images.length} image(s)` : ""})`);
 
     try {
+      this.systemPromptReady = this.refreshSystemPrompt();
       await this.systemPromptReady;
       await this.runAgentTurn(this.abortController.signal);
     } finally {
@@ -1272,11 +1455,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private async maybeAutoCompactContext(signal: AbortSignal): Promise<void> {
     const cfg = vscode.workspace.getConfiguration("hooshyar");
-    if (!cfg.get<boolean>("experimentalAutoCompact", false) || this.isCompactingContext) return;
+    if (this.isCompactingContext) return;
 
     const maxContextChars = cfg.get<number>("maxContextChars", 60_000);
     const currentChars = historyCharLength(this.history);
-    if (currentChars < Math.floor(maxContextChars * 0.8)) return;
+    const autoCompactEnabled = cfg.get<boolean>("experimentalAutoCompact", false);
+    const forceCompaction = currentChars >= Math.floor(maxContextChars * 0.95);
+    if (!forceCompaction && (!autoCompactEnabled || currentChars < Math.floor(maxContextChars * 0.8))) return;
 
     const plan = planContextCompaction(this.history, Math.floor(maxContextChars * 0.35));
     if (!plan || plan.compactedChars < 4_000) return;
@@ -1328,12 +1513,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         signal
       );
 
-      if (signal.aborted || summaryError || !summary.trim()) {
-        if (summaryError) logWarn(`Auto-compaction skipped: ${summaryError}`);
-        return;
-      }
-
       const maxSummaryChars = Math.max(2_000, Math.floor(maxContextChars * 0.2));
+      if (signal.aborted) return;
+      if (summaryError || !summary.trim()) {
+        // At the hard context limit we must still reduce history even if the
+        // provider cannot summarize. This deterministic handoff retains the
+        // compacted transcript facts and recent verbatim turns.
+        logWarn(`Model compaction unavailable; applying deterministic fallback: ${summaryError || "empty summary"}`);
+        summary = source.slice(0, maxSummaryChars);
+      }
       const compactedMessage: Message = {
         role: "user",
         content:
@@ -1352,7 +1540,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.postToWebview({ type: "contextCompacted", beforeTokens, afterTokens });
       logInfo(`Context compacted: ~${beforeTokens} tokens to ~${afterTokens} tokens`);
     } catch (err: any) {
-      logWarn(`Auto-compaction failed; using normal context trimming: ${err?.message ?? err}`);
+      logWarn(`Model auto-compaction failed; applying deterministic fallback: ${err?.message ?? err}`);
+      if (!signal.aborted) {
+        const maxSummaryChars = Math.max(2_000, Math.floor(maxContextChars * 0.2));
+        const beforeTokens = Math.ceil(plan.originalChars / 4);
+        this.history = [{
+          role: "user",
+          content:
+            "[Auto-compacted context — deterministic fallback]\n\n" +
+            source.slice(0, maxSummaryChars) +
+            "\n\n[Continue from the recent verbatim turns below.]"
+        }, ...plan.recentMessages];
+        const afterTokens = Math.ceil(historyCharLength(this.history) / 4);
+        this.postUsage();
+        await this.persistCurrentSession();
+        this.postToWebview({ type: "contextCompacted", beforeTokens, afterTokens });
+      }
     } finally {
       this.isCompactingContext = false;
     }
@@ -1364,7 +1567,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const cfg = vscode.workspace.getConfiguration("hooshyar");
     await this.maybeAutoCompactContext(signal);
     if (signal.aborted) return;
-    const MAX_AGENT_DEPTH = cfg.get<number>("maxAgentTurns", 25);
+    const MAX_AGENT_DEPTH = cfg.get<number>("maxAgentTurns", 35);
     if (depth >= MAX_AGENT_DEPTH) {
       this.postToWebview({
         type: "error",
@@ -1374,9 +1577,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    const isChatMode = this.currentMode === "chat";
+    const isChatMode = this.currentMode === "chat" || this.currentMode === "ask";
+    const isPlanMode = this.currentMode === "plan";
     const enableTools = cfg.get<boolean>("enableTools", true);
-    const enableShellTool = cfg.get<boolean>("enableShellTool", true);
+    const enableShellTool = !isPlanMode && cfg.get<boolean>("enableShellTool", true);
     const maxCodebaseFiles = cfg.get<number>("maxCodebaseFiles", 400);
 
     const mcpServers = await this.getMcpServers();
@@ -1386,6 +1590,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         mcpTools = await this.mcpManager.listTools(mcpServers);
       } catch (err: any) {
         logError(`Failed to fetch MCP tools: ${err?.message ?? err}`);
+      }
+    }
+
+    const toolRegistry = createAgentToolRegistry({
+      enableShellTool,
+      mcpTools,
+      executionContext: {
+        maxCodebaseFiles,
+        mcpManager: this.mcpManager,
+        mcpServers,
+        signal,
+        onTaskUpdate: (tasks) => {
+          this.taskList = tasks;
+          this.postToWebview({ type: "taskListUpdate", tasks });
+        }
+      }
+    });
+    if (isPlanMode) {
+      for (const tool of toolRegistry.list()) {
+        if (tool.risk !== "read") toolRegistry.unregister(tool.name);
       }
     }
 
@@ -1400,7 +1624,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.lastTurnTextLength = 0;
     const apiMessages = this.prepareMessagesForApi();
     const useNative = this.effectiveToolProtocol() === "native";
-    const sendTools = !isChatMode && enableTools && useNative;
+    const capabilities = detectModelCapabilities(
+      { ...this.readConfig(), toolProtocol: useNative ? "native" : "text" },
+      enableTools
+    );
+    const sendTools = !isChatMode && capabilities.tools && useNative;
 
     if (isChatMode) {
       this.setAgentStatus("در حال آماده‌سازی پاسخ... / Generating response...");
@@ -1416,7 +1644,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       {
         messages: apiMessages,
         system: this.cachedSystemPrompt,
-        tools: sendTools ? buildToolDefinitions({ enableShellTool, mcpTools }) : undefined,
+        tools: sendTools ? toolRegistry.getDefinitions() : undefined,
         tool_choice: sendTools ? { type: "auto" } : undefined
       },
       {
@@ -1440,6 +1668,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             list_codebase: "بررسی ساختار پروژه",
             list_files: "مشاهده فایل‌های پوشه",
             search_codebase: "جستجو در کدها",
+            semantic_search: "جستجوی معنایی در پروژه",
+            delegate_search: "جستجوی واگذارشده در پروژه",
+            create_plan: "ایجاد برنامهٔ ساخت‌یافته",
+            get_plan: "خواندن برنامهٔ ساخت‌یافته",
+            update_plan_step: "به‌روزرسانی مرحلهٔ برنامه",
+            verify_changes: "اعتبارسنجی تغییرات",
+            apply_changeset: "اعمال تراکنش تغییرات",
+            find_symbol: "یافتن نماد کد",
+            find_definition: "یافتن تعریف نماد",
+            find_references: "یافتن استفاده‌های نماد",
+            find_implementations: "یافتن پیاده‌سازی‌ها",
+            get_hover: "خواندن اطلاعات نوع",
+            get_document_symbols: "بررسی ساختار فایل",
+            get_call_hierarchy: "بررسی زنجیره فراخوانی",
+            rename_symbol: "تغییر نام نماد",
             search_replace: "ویرایش و اصلاح کد",
             write_file: "نوشتن یا ذخیره فایل",
             run_command: "اجرای دستور در ترمینال",
@@ -1532,6 +1775,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     if (assembledBlocks.length === 0) {
       if (hasApiError) {
+        this.transitionAgent("FAILED", "Provider error");
         return;
       }
       if (depth === 1) {
@@ -1572,6 +1816,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     if (isChatMode) {
       // In Chat mode: do not execute tools or synthesize file writes
+      this.transitionAgent("COMPLETED", "Chat response completed");
+      await this.maybeAutoCompactContext(signal);
+      this.postUsage();
       return;
     }
 
@@ -1581,7 +1828,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       // answer to the user. NEVER run textual regex extraction on conversational answers in native mode!
       const allowTextFallback = !useNative || depth === 0;
       if (allowTextFallback) {
-        const knownToolNames = buildToolDefinitions({ enableShellTool: true, mcpTools }).map((t) => t.name);
+        const knownToolNames = toolRegistry.getDefinitions().map((t) => t.name);
         const fallback = extractTextualToolCalls(assembledBlocks, knownToolNames);
         if (fallback.toolCalls.length > 0) {
           toolUseBlocks = fallback.toolCalls;
@@ -1634,6 +1881,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (pills.length > 0) {
         this.postToWebview({ type: "followUpPills", pills } as any);
       }
+      this.transitionAgent("COMPLETED", "Agent response completed");
+      await this.maybeAutoCompactContext(signal);
+      this.postUsage();
       return; // plain end_turn, nothing left to do
     }
 
@@ -1642,6 +1892,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const pendingAtCompletion = this.taskList.filter((t) => t.status === "pending" || t.status === "in_progress");
     const completionAccepted =
       toolUseBlocks.length === 1 && toolUseBlocks[0].name === "task_complete" && pendingAtCompletion.length === 0;
+    this.transitionAgent("WAITING_FOR_TOOL", `${toolUseBlocks.length} tool call(s)`);
 
     // Helper to process a single tool call with safety checks, webview updates, and prompt injection isolation
     const processSingleCall = async (call: ToolUseBlock): Promise<ContentBlock> => {
@@ -1687,13 +1938,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         return { type: "tool_result", tool_use_id: call.id, content: loopNotice };
       }
 
-      // Exploration depth protection: At depth >= 6, cap excessive reading to prevent endless exploration
-      if (depth >= 6 && readTools.has(call.name)) {
-        logInfo(`Exploration cap reached for ${call.name} at depth ${depth}`);
-        const capNotice = `[Exploration limit reached: You have already completed ${depth + 1} exploration turns. Do not call ${call.name} again. Please proceed directly to modifying the target file with search_replace/write_file, or deliver your final answer to the user in chat.]`;
-        this.postToWebview({ type: "toolResult", id: call.id, content: capNotice, isError: false });
-        return { type: "tool_result", tool_use_id: call.id, content: capNotice };
-      }
+
 
       this.postToWebview({ type: "toolCall", id: call.id, name: call.name, input: call.input });
 
@@ -1726,8 +1971,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
       this.setAgentStatus(toolDesc);
 
-      // Mutating tools require user confirmation
-      if (isMutatingTool(call.name)) {
+      const registeredTool = toolRegistry.get(call.name);
+      // Write and execution tools require centralized policy evaluation and, when needed, confirmation.
+      if (registeredTool && (registeredTool.risk === "write" || registeredTool.risk === "execute")) {
         const statusTarget =
           typeof call.input?.path === "string" && call.input.path !== "undefined"
             ? call.input.path
@@ -1735,10 +1981,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             ? String(call.input?.command || "")
             : "";
         this.setAgentStatus(`در انتظار تأیید شما برای ویرایش: ${statusTarget}`);
+        this.transitionAgent("WAITING_FOR_APPROVAL", call.name);
         const approved = await this.requestMutatingApproval(call);
         if (!approved) {
           this.postToWebview({ type: "toolResult", id: call.id, content: "Declined by user.", isError: true });
           this.setAgentStatus("عملیات توسط کاربر رد شد.");
+          this.transitionAgent("REQUESTING_MODEL", "Approval declined");
           return {
             type: "tool_result",
             tool_use_id: call.id,
@@ -1746,6 +1994,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             is_error: true
           };
         }
+        this.transitionAgent("RUNNING_TOOL", call.name);
         const approvedPath =
           typeof call.input?.path === "string" && call.input.path !== "undefined" ? call.input.path : "";
         const execDesc =
@@ -1758,16 +2007,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
 
       try {
-        const rawOutput = await executeTool(call.name, call.input, {
-          maxCodebaseFiles,
-          mcpManager: this.mcpManager,
-          mcpServers,
-          signal,
-          onTaskUpdate: (tasks) => {
-            this.taskList = tasks;
-            this.postToWebview({ type: "taskListUpdate", tasks });
-          }
-        });
+        this.transitionAgent("RUNNING_TOOL", call.name);
+        const invocation = await toolRegistry.invoke(call.name, call.input, { invocationId: call.id, signal });
+        const rawOutput = invocation.output;
 
         let output = truncateToolOutput(rawOutput);
         const hasActivePlan = this.taskList.some((t) => t.status === "pending" || t.status === "in_progress");
@@ -1799,6 +2041,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               type: "sessionReviewUpdate",
               files: ReviewManager.getInstance().getModifiedFiles()
             } as any);
+            // Allow re-reading modified file without false loop detection
+            for (let i = executedSignatures.length - 1; i >= 0; i--) {
+              if (executedSignatures[i].startsWith("read_file:") && executedSignatures[i].includes(`"${filePath}"`)) {
+                executedSignatures.splice(i, 1);
+              }
+            }
+          }
+          if (call.name === "manage_memory") {
+            void this.refreshSystemPrompt();
           }
           const cfg = vscode.workspace.getConfiguration("hooshyar");
           const openDiffOnEdit = cfg.get<boolean>("openDiffOnEdit", true);
@@ -1826,8 +2077,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       } catch (err: any) {
         const message = err?.message ?? String(err);
         this.postToWebview({ type: "toolResult", id: call.id, content: message, isError: true });
-        this.setAgentStatus(`خطا در اجرای ابزار ${call.name}: ${message}`);
-        return { type: "tool_result", tool_use_id: call.id, content: message, is_error: true };
+        this.setAgentStatus(`خطا در اجرای ابزار ${call.name}: ${message.split("\n")[0]}`);
+        let modelErrorMessage = message;
+        if (call.name === "run_command" || call.name === "run_in_terminal") {
+          const cmdStr = String(call.input?.command || "").trim();
+          if (/^(?:cat|type|Get-Content|head|tail)\b/i.test(cmdStr)) {
+            modelErrorMessage += "\n\n[SYSTEM GUIDANCE: DO NOT use shell commands to read file contents. Use the dedicated 'read_file' tool with parameter 'path' instead.]";
+          } else {
+            modelErrorMessage += "\n\n[SYSTEM GUIDANCE: The command exited with an error. Analyze the exit code, STDOUT, and STDERR above. Diagnose the cause of the failure, adjust the command or fix the relevant files, and execute the corrected command.]";
+          }
+        }
+        return { type: "tool_result", tool_use_id: call.id, content: modelErrorMessage, is_error: true };
       }
     };
 
@@ -1836,7 +2096,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     let currentBatch: ToolUseBlock[] = [];
 
     for (const call of toolUseBlocks) {
-      if (!isParallelSafeTool(call.name)) {
+      if (!toolRegistry.get(call.name)?.parallelSafe) {
         if (currentBatch.length > 0) {
           batches.push(currentBatch);
           currentBatch = [];
@@ -1871,8 +2131,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       // Keep role alternation valid without rendering a duplicate completion bubble.
       this.history.push({ role: "assistant", content: [{ type: "text", text: INTERNAL_TASK_COMPLETE_TEXT }] });
       this.setAgentStatus("کار با موفقیت تکمیل شد.");
+      this.transitionAgent("COMPLETED", "task_complete accepted");
       return;
     }
+    this.transitionAgent("REQUESTING_MODEL", "Tool results ready");
     this.setAgentStatus(`اطلاعات کدهای پروژه دریافت شد. در حال تحلیل توسط مدل هوش مصنوعی (دور ${depth + 2})...`);
     await this.runAgentTurn(signal, depth + 1, executedSignatures);
   }
@@ -1903,7 +2165,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <div id="chat-pane-header">
         <div class="header-left">
           <button type="button" id="sidebar-toggle" title="تاریخچه گفتگوها / Toggle chat history" data-i18n-title="sidebar_toggle_title">⌵</button>
-          <span id="chat-pane-title">Hooshyar</span>
+          <div class="session-heading"><span id="chat-pane-title">Hooshyar</span><span id="session-subtitle">New session</span></div>
+          <span id="session-status" class="session-status idle"><span class="status-dot"></span><span id="session-status-text">Idle</span></span>
         </div>
         <div class="mode-selector" id="mode-selector">
           <button type="button" class="mode-btn active" id="mode-agent-btn" data-mode="agent" title="حالت اجنت: اجرای خودکار، ویرایش و ایجاد فایل‌ها / Agent Mode: Autonomous execution, edits & creates files" data-i18n-title="mode_agent_title">
@@ -1912,10 +2175,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           </button>
           <button type="button" class="mode-btn" id="mode-chat-btn" data-mode="chat" title="حالت چت: فقط گفتگو و راهنمایی بدون تغییر فایل‌ها / Chat Mode: Conversational only, no file edits" data-i18n-title="mode_chat_title">
             <span class="mode-icon">○</span>
-            <span class="mode-text" data-i18n="mode_chat">Chat</span>
+            <span class="mode-text">Ask</span>
+          </button>
+          <button type="button" class="mode-btn" id="mode-plan-btn" data-mode="plan" title="Analyze the workspace and create a read-only implementation plan">
+            <span class="mode-icon">≡</span>
+            <span class="mode-text">Plan</span>
           </button>
         </div>
         <div class="header-actions">
+          <button type="button" id="session-menu-btn" class="header-btn labeled-trigger" aria-haspopup="menu" aria-expanded="false" title="Open session menu"><span>Sessions</span><span aria-hidden="true">⌄</span></button>
+          <div id="session-menu" class="header-menu hidden" role="menu">
+            <button type="button" data-action="new">New session</button><button type="button" data-action="history">Session history</button>
+            <button type="button" data-action="rename">Rename session</button><button type="button" data-action="clear">Clear session</button>
+            <button type="button" data-action="delete" class="danger">Delete session</button><button type="button" data-action="settings">Extension settings</button>
+          </div>
           <button type="button" id="help-btn" class="header-btn" title="راهنمای تهیه API و پشتیبانی / API Guide & Support" data-i18n-title="help_btn_title">?</button>
           <button type="button" id="lang-btn" class="header-btn" title="تغییر زبان / Switch Language" data-i18n-title="lang_btn_title">🌐 FA</button>
           <button type="button" id="settings-btn" class="header-btn" title="تنظیمات / Settings" data-i18n-title="settings_btn_title">⚙️</button>
@@ -1923,25 +2196,48 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       </div>
       <div id="tasklist" class="hidden"></div>
       <div id="messages"></div>
+      <button type="button" id="new-activity-btn" class="hidden">↓ New activity</button>
       <div id="approval-banner" class="hidden"></div>
       <div id="mention-menu" class="hidden"></div>
       <div id="statusbar">
         <span id="usage-info">0 tokens</span>
       </div>
+      <div id="activity-footer" class="hidden"><span class="activity-spinner"></span><span id="activity-footer-text">Working…</span><button type="button" id="activity-stop-btn">Stop</button></div>
       <div id="attachments-bar" class="hidden"></div>
       <div class="chat-input-wrapper">
         <form id="input-form" class="copilot-input-box">
+          <div class="composer-meta" id="composer-meta">
+            <span id="active-rules-indicator" title="Active workspace context">Workspace context</span>
+            <button type="button" id="context-usage-btn" class="labeled-trigger" aria-haspopup="dialog" aria-expanded="false" title="Open context inspector"><span aria-hidden="true">◎</span> Context 0%</button>
+          </div>
+          <div id="context-inspector" class="context-inspector hidden" role="dialog" aria-label="Context usage">
+            <div class="context-inspector-header"><strong>Context</strong><button type="button" id="close-context-inspector" aria-label="Close">×</button></div>
+            <div id="context-inspector-body"></div>
+          </div>
           <div class="input-text-area">
             <textarea id="input" rows="1" placeholder="از هوشیار بپرسید... / Ask Hooshyar... (/ commands, # context)" data-i18n-placeholder="input_placeholder"></textarea>
           </div>
           <div class="input-toolbar">
             <div class="toolbar-left">
-              <button type="button" id="attach-btn" class="tool-icon-btn" title="ضمیمه فایل یا تصویر / Attach file or image" data-i18n-title="attach_btn_title">＋</button>
+              <button type="button" id="context-picker-btn" class="composer-select" aria-haspopup="menu" aria-expanded="false">＋ Context</button>
+              <div id="context-picker" class="composer-popover hidden" role="menu">
+                <button type="button" data-context="file">File…</button>
+                <button type="button" data-context="active">Active file</button>
+                <button type="button" data-context="selection">Selection</button>
+                <button type="button" data-context="problems">Problems</button>
+                <button type="button" data-context="git">Git changes</button>
+                <button type="button" data-context="codebase">Codebase</button>
+              </div>
+              <button type="button" id="attach-btn" class="tool-icon-btn hidden" title="ضمیمه فایل یا تصویر / Attach file or image" data-i18n-title="attach_btn_title">＋</button>
               <button type="button" id="attach-active-btn" class="tool-icon-btn" title="ضمیمه فایل فعال ادیتور / Attach active editor file" data-i18n-title="attach_active_btn_title">▱</button>
               <button type="button" id="context-quick-btn" class="tool-icon-btn badge-btn" title="ارجاع کانتکست (#file, #selection, #git)">#</button>
               <button type="button" id="slash-quick-btn" class="tool-icon-btn badge-btn" title="دستورات اسلش (/fix, /explain, /tests)">/</button>
             </div>
             <div class="toolbar-right">
+              <select id="model-picker" class="composer-select" aria-label="Model"><option value="">Model</option></select>
+              <select id="permission-picker" class="composer-select" aria-label="Permission mode" title="Permission mode">
+                <option value="ask">Ask every time</option><option value="safe">Safe</option><option value="edit">Auto edit</option><option value="full">Full access</option>
+              </select>
               <button type="submit" id="send-btn" title="ارسال پیام / Send (Enter)" data-i18n-title="send_btn_title">
                 <span class="send-icon">↑</span>
                 <span class="send-label" data-i18n="send_btn">Send</span>
@@ -1954,6 +2250,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           </div>
         </form>
       </div>
+      <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
       <div id="settings-modal" class="hidden">
         <div class="settings-dialog">
           <div class="settings-header">
@@ -2107,8 +2404,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               <div class="setting-row">
                 <label for="cfg-mcp-servers">MCP Servers Configuration (JSON):</label>
                 <textarea id="cfg-mcp-servers" rows="4" placeholder='{"filesystem": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "\${workspaceFolder}"]}}' style="width:100%;font-family:monospace;font-size:11px;resize:vertical;box-sizing:border-box;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border);border-radius:4px;padding:6px;"></textarea>
-                <div class="setting-hint">پیکربندی سرورهای MCP محلی (JSON). پشتیبانی از \${workspaceFolder} و متغیرهای سیستم. همچنین فایل‌های .hooshyar/mcp.json در پروژه نیز لود می‌شوند.</div>
+                <div class="setting-hint">پیکربندی سرورهای MCP (JSON). توکن‌های امنیتی Figma به صورت خودکار از مخزن امن در درخواست‌ها تزریق می‌شوند.</div>
               </div>
+
+              <!-- Figma MCP Integration & Account Auth -->
+              <div class="figma-mcp-card" id="figma-mcp-card">
+                <div class="figma-card-header">
+                  <div class="figma-card-title">
+                    <span class="figma-icon">🎨</span>
+                    <strong>اتصال به اکانت Figma (حل مشکل Rate Limit)</strong>
+                  </div>
+                  <span id="figma-auth-badge" class="figma-badge disconnected">⚪ اکانت متصل نیست</span>
+                </div>
+                <div class="setting-hint figma-hint">
+                  کلیدهای دستی API فیگما سقف بسیار پایینی دارند و فوراً به خطای Rate Limit (429) برمی‌خورند. با ورود مستقیم به اکانت فیگما از طریق OAuth، یا اتصال به اپلیکیشن دسکتاپ Figma در حالت Dev Mode، می‌توانید بدون ریت‌لیمیت کار کنید.
+                </div>
+                <div class="figma-actions-row">
+                  <button type="button" id="figma-login-btn" class="secondary-btn figma-btn">🔑 ورود با اکانت فیگما (OAuth Login)</button>
+                  <button type="button" id="figma-logout-btn" class="secondary-btn figma-btn hidden">خروج از اکانت فیگما</button>
+                  <button type="button" id="figma-desktop-btn" class="secondary-btn figma-btn">🖥️ اتصال به Figma Desktop (لوکال)</button>
+                </div>
+                <div id="figma-auth-status" class="test-status" style="margin-top:6px;"></div>
+              </div>
+
               <div class="test-conn-row" style="margin-top:6px;">
                 <button type="button" id="test-mcp-btn" class="secondary-btn">🔌 تست سرورهای MCP / Test MCP</button>
                 <span id="test-mcp-status" class="test-status"></span>

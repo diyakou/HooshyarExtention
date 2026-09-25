@@ -2,7 +2,7 @@
   "name": "houshiar",
   "displayName": "houshiar",
   "description": "AI coding assistant powered by your own Anthropic-compatible /v1/messages provider (Houshiar v1).",
-  "version": "0.7.3",
+  "version": "0.8.4",
   "publisher": "WebDops",
   "license": "MIT",
   "repository": {
@@ -286,7 +286,7 @@
         },
         "hooshyar.maxAgentTurns": {
           "type": "number",
-          "default": 25,
+          "default": 35,
           "minimum": 5,
           "maximum": 100,
           "description": "Maximum number of autonomous tool execution turns the agent can execute in one request (Plan Mode)."
@@ -297,6 +297,42 @@
           "minimum": 1000,
           "maximum": 600000,
           "description": "Default timeout in milliseconds for foreground run_command executions."
+        },
+        "hooshyar.contextInputBudgetTokens": {
+          "type": "number",
+          "default": 20000,
+          "minimum": 1000,
+          "maximum": 200000,
+          "description": "Token budget used by the context engine for workspace and attachment context."
+        },
+        "hooshyar.experimental.semanticSearch": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable incremental code indexing and the hybrid semantic_search agent tool."
+        },
+        "hooshyar.search.semanticWeight": {
+          "type": "number",
+          "default": 0.5,
+          "minimum": 0,
+          "maximum": 1
+        },
+        "hooshyar.search.textWeight": {
+          "type": "number",
+          "default": 0.2,
+          "minimum": 0,
+          "maximum": 1
+        },
+        "hooshyar.search.symbolWeight": {
+          "type": "number",
+          "default": 0.2,
+          "minimum": 0,
+          "maximum": 1
+        },
+        "hooshyar.search.contextWeight": {
+          "type": "number",
+          "default": 0.1,
+          "minimum": 0,
+          "maximum": 1
         },
         "hooshyar.mcpServers": {
           "type": [
@@ -402,7 +438,7 @@
         },
         "hooshyar.maxContextChars": {
           "type": "number",
-          "default": 60000,
+          "default": 160000,
           "minimum": 10000,
           "description": "Approximate character budget for chat history sent to the model (older turns are trimmed to save tokens)."
         },
@@ -466,12 +502,34 @@
             "pnpm",
             "yarn",
             "node",
+            "npx",
+            "bun",
+            "deno",
             "python",
+            "python3",
+            "py",
             "pytest",
+            "pip",
+            "uv",
+            "php",
+            "composer",
+            "artisan",
             "git",
             "cargo",
             "go",
-            "make"
+            "make",
+            "dotnet",
+            "java",
+            "mvn",
+            "gradle",
+            "cat",
+            "type",
+            "dir",
+            "ls",
+            "Get-Content",
+            "Get-ChildItem",
+            "Get-Command",
+            "echo"
           ],
           "description": "When run_command is enabled, only commands whose executable name is in this list are allowed (unless the full command matches an entry)."
         },

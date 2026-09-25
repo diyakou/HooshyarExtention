@@ -370,7 +370,7 @@ export function userWantsFileWrite(userText: string): boolean {
 
 export function inferFilePath(userText: string, assistantText: string): string | null {
   const fromUser = userText.match(
-    /(?:^|[\s"'`(\[])([\w./\\-]+\.(?:md|txt|ts|tsx|js|jsx|py|json|css|html|yml|yaml|toml|xml|csv|sh|bat|ps1|sql))(?:[\s"'`)\]]|$)/i
+    /(?:^|[\s"'`([])([\w./\\-]+\.(?:md|txt|ts|tsx|js|jsx|py|json|css|html|yml|yaml|toml|xml|csv|sh|bat|ps1|sql))(?:[\s"'`)\]]|$)/i
   );
   if (fromUser) return normalizeRelPath(fromUser[1]);
 
@@ -414,9 +414,12 @@ export function normalizeRelPath(p: string): string {
   return norm;
 }
 
-export function truncateToolOutput(output: string, max = 14_000): string {
+export function truncateToolOutput(output: string, max = 45_000): string {
   if (output.length <= max) return output;
-  return output.slice(0, max) + `\n... (truncated — ${output.length - max} more characters)`;
+  return (
+    output.slice(0, max) +
+    `\n... (truncated — ${output.length - max} more characters. For files, use read_file with start_line and end_line to inspect remaining sections.)`
+  );
 }
 
 export function flattenToolHistoryForApi(messages: Message[]): Message[] {

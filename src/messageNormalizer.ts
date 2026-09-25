@@ -185,8 +185,10 @@ export async function buildSystemPrompt(basePrompt: string): Promise<string> {
     `- ${buildHostCommandGuidance(envInfo)}\n` +
     (envInfo.isWindows
       ? "- CRITICAL WINDOWS COMMAND RULES: NEVER generate Linux-only commands such as `ls -la`, `cat`, `grep`, `rm -rf`, `export VAR=val`, `source venv/bin/activate`, `touch`, or `chmod`. Do not mix PowerShell and CMD syntax.\n" +
+        "- CRITICAL TOOL USAGE: NEVER use shell commands (`cat`, `type`, `Get-Content`, `head`, `tail`) to read file contents! ALWAYS use the dedicated `read_file` tool to inspect files.\n" +
         "- Before emitting run_command or run_in_terminal, verify every command against the Active Shell above."
-      : "- Before emitting run_command or run_in_terminal, verify every command uses the Active Shell syntax above.");
+      : "- CRITICAL TOOL USAGE: NEVER use shell commands (`cat`, `head`, `tail`) to read file contents! ALWAYS use the dedicated `read_file` tool to inspect files.\n" +
+        "- Before emitting run_command or run_in_terminal, verify every command uses the Active Shell syntax above.");
 
   const workspaceInfo = `\n\n## CURRENT WORKSPACE\ncurrent working directory is: ${rootsSummary}\nActive workspace folder(s):\n${rootsSummary}${multiFolderNotice}`;
   const [rules, skills] = await Promise.all([loadProjectRules(), loadSkills()]);

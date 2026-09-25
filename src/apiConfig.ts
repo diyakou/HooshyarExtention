@@ -85,6 +85,32 @@ export function normalizeApiUrl(baseUrl: string, format: ApiFormat = "anthropic"
   return `${base}/v1/messages`;
 }
 
+export function normalizeModelsUrl(baseUrl: string): string {
+  const trimmed = baseUrl.trim().replace(/\/+$/, "");
+  const apiRoot = trimmed.replace(/\/(?:chat\/completions?|messages?)$/i, "");
+  if (/\/v1$/i.test(apiRoot)) return `${apiRoot}/models`;
+  return `${apiRoot}/v1/models`;
+}
+
+export async function fetchAvailableModels(config: ApiClientConfig, signal?: AbortSignal): Promise<string[]> {
+  const response = await fetch(normalizeModelsUrl(config.baseUrl), {
+    method: "GET",
+    headers: buildRequestHeaders(config),
+    signal
+  });
+  if (!response.ok) {
+    const detail = (await response.text()).slice(0, 300);
+    throw new Error(`Models request failed (${response.status})${detail ? `: ${detail}` : ""}`);
+  }
+  const payload: any = await response.json();
+  const entries = Array.isArray(payload) ? payload : Array.isArray(payload?.data) ? payload.data : Array.isArray(payload?.models) ? payload.models : [];
+  const ids: string[] = entries
+    .map((item: any): unknown => typeof item === "string" ? item : item?.id || item?.name)
+    .filter((id: unknown): id is string => typeof id === "string" && id.trim().length > 0)
+    .map((id: string) => id.trim());
+  return [...new Set<string>(ids)].sort((a: string, b: string) => a.localeCompare(b));
+}
+
 export function readInlineApiConfig(apiKey: string): ApiClientConfig {
   const base = readApiClientConfig(apiKey);
   const cfg = vscode.workspace.getConfiguration("hooshyar");

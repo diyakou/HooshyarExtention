@@ -213,6 +213,30 @@ describe("applySearchReplace", () => {
     assert.equal(res.count, 1);
     assert.match(res.updatedText, /const y = 20;/);
   });
+
+  it("prevents ambiguous replacement when multiple occurrences exist without replace_all", () => {
+    const original = "const x = 1;\nconst y = 2;\nconst x = 1;\n";
+    assert.throws(
+      () => applySearchReplace(original, "const x = 1;", "const x = 99;"),
+      /Found 2 occurrences of 'old_string'/
+    );
+  });
+
+  it("allows replacing multiple occurrences when replace_all is true", () => {
+    const original = "const x = 1;\nconst y = 2;\nconst x = 1;\n";
+    const res = applySearchReplace(original, "const x = 1;", "const x = 99;", true);
+    assert.equal(res.count, 2);
+    assert.equal(res.updatedText, "const x = 99;\nconst y = 2;\nconst x = 99;\n");
+  });
+
+  it("handles copied code with leading line numbers in old_string", () => {
+    const original = "function calculate() {\n  const rate = 0.05;\n  return total * rate;\n}\n";
+    const oldWithLineNums = "2:   const rate = 0.05;\n3:   return total * rate;";
+    const newWithLineNums = "2:   const rate = 0.1;\n3:   return total * rate;";
+    const res = applySearchReplace(original, oldWithLineNums, newWithLineNums);
+    assert.equal(res.count, 1);
+    assert.match(res.updatedText, /const rate = 0\.1;/);
+  });
 });
 
 describe("normalizeToolInput", () => {
@@ -286,6 +310,20 @@ describe("normalizeToolInput", () => {
     assert.equal(norm2.path, "app.ts");
     const norm3 = normalizeToolInput("write_file", { name: "app.ts", content: "export {}" });
     assert.equal(norm3.path, "app.ts");
+  });
+
+  it("normalizes start_line and end_line aliases for read_file", () => {
+    const norm1 = normalizeToolInput("read_file", { path: "src/app.ts", start_line: 10, end_line: 50 });
+    assert.equal(norm1.start_line, 10);
+    assert.equal(norm1.end_line, 50);
+
+    const norm2 = normalizeToolInput("read_file", { path: "src/app.ts", startLine: "20", endLine: "80" });
+    assert.equal(norm2.start_line, 20);
+    assert.equal(norm2.end_line, 80);
+
+    const norm3 = normalizeToolInput("read_file", { path: "src/app.ts", line_start: 5, line_end: 15 });
+    assert.equal(norm3.start_line, 5);
+    assert.equal(norm3.end_line, 15);
   });
 });
 

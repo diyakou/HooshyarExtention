@@ -13,6 +13,8 @@ export class MemoryManager {
   private memento: vscode.Memento | null = null;
   private inMemoryFallback: Map<string, MemoryEntry> = new Map();
 
+  private listeners: Array<() => void> = [];
+
   private constructor() {}
 
   public static getInstance(): MemoryManager {
@@ -20,6 +22,25 @@ export class MemoryManager {
       MemoryManager.instance = new MemoryManager();
     }
     return MemoryManager.instance;
+  }
+
+  public onDidChange(listener: () => void): { dispose: () => void } {
+    this.listeners.push(listener);
+    return {
+      dispose: () => {
+        this.listeners = this.listeners.filter((l) => l !== listener);
+      }
+    };
+  }
+
+  private notifyChanged(): void {
+    for (const listener of [...this.listeners]) {
+      try {
+        listener();
+      } catch {
+        // Ignore listener errors
+      }
+    }
   }
 
   public initialize(memento: vscode.Memento): void {
@@ -61,6 +82,7 @@ export class MemoryManager {
       updatedAt: new Date().toISOString()
     };
     await this.saveEntries(entries);
+    this.notifyChanged();
   }
 
   public recall(key: string): string | undefined {
@@ -75,6 +97,7 @@ export class MemoryManager {
     if (entries[cleanKey]) {
       delete entries[cleanKey];
       await this.saveEntries(entries);
+      this.notifyChanged();
       return true;
     }
     return false;
@@ -91,6 +114,7 @@ export class MemoryManager {
 
   public async clear(): Promise<void> {
     await this.saveEntries({});
+    this.notifyChanged();
   }
 
   public formatForSystemPrompt(): string {

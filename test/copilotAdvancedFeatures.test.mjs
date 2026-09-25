@@ -46,8 +46,22 @@ test("Advanced Copilot Parity Features Tests", async (t) => {
     assert.equal(deleted, true);
     assert.equal(memory.recall("testFramework"), undefined);
 
+    let changeCount = 0;
+    const sub = memory.onDidChange(() => {
+      changeCount++;
+    });
+
+    await memory.store("tempKey", "tempVal");
+    assert.equal(changeCount, 1);
+
+    await memory.delete("tempKey");
+    assert.equal(changeCount, 2);
+
     await memory.clear();
+    assert.equal(changeCount, 3);
     assert.equal(memory.formatForSystemPrompt(), "");
+
+    sub.dispose();
   });
 
   await t.test("cleanHtmlToMarkdown converts HTML to clean readable text", () => {

@@ -104,6 +104,16 @@ export class McpManager {
   private serverStatuses = new Map<string, McpServerStatus>();
   private toolMapping = new Map<string, { serverName: string; originalToolName: string }>();
   private sequence = 0;
+  private figmaTokenProvider?: () => Promise<string | null>;
+  private figmaTokenRefresher?: () => Promise<string | null>;
+
+  public setFigmaTokenProvider(
+    provider: () => Promise<string | null>,
+    refresher?: () => Promise<string | null>
+  ): void {
+    this.figmaTokenProvider = provider;
+    this.figmaTokenRefresher = refresher;
+  }
 
   public async listTools(servers: Record<string, McpServerConfig>): Promise<ToolDefinition[]> {
     const result: ToolDefinition[] = [];
@@ -325,25 +335,65 @@ export class McpManager {
     headers: Record<string, string> | undefined,
     method: string,
     params: unknown,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    isRetry = false
   ): Promise<any> {
     const id = `${serverName}-${++this.sequence}`;
     const payload = { jsonrpc: "2.0", id, method, params };
     const wsFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     const resolvedUrl = resolveVariables(url, wsFolder);
 
+    const mergedHeaders: Record<string, string> = { ...(headers || {}) };
+    const isFigma = serverName.toLowerCase() === "figma" || resolvedUrl.includes("mcp.figma.com");
+
+    if (isFigma && !mergedHeaders["Authorization"] && !mergedHeaders["authorization"] && this.figmaTokenProvider) {
+      try {
+        const token = await this.figmaTokenProvider();
+        if (token) {
+          mergedHeaders["Authorization"] = `Bearer ${token}`;
+        }
+      } catch (err) {
+        logWarn(`[MCP:figma] Failed to retrieve Figma token: ${err}`);
+      }
+    }
+
     const res = await fetch(resolvedUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Accept: "application/json, text/event-stream",
-        ...(headers || {})
+        ...mergedHeaders
       },
       body: JSON.stringify(payload),
       signal
     });
 
     if (!res.ok) {
+      if (res.status === 401 && isFigma && !isRetry && this.figmaTokenRefresher) {
+        logInfo("[MCP:figma] Received HTTP 401, attempting token refresh...");
+        try {
+          const refreshed = await this.figmaTokenRefresher();
+          if (refreshed) {
+            const retryHeaders = { ...headers, Authorization: `Bearer ${refreshed}` };
+            return this.remoteRequest(serverName, url, retryHeaders, method, params, signal, true);
+          }
+        } catch (refreshErr) {
+          logError(`[MCP:figma] Token refresh failed: ${refreshErr}`);
+        }
+      }
+
+      if (res.status === 401 && isFigma) {
+        throw new Error(
+          `Remote MCP server 'figma' returned HTTP 401: Unauthorized. لطفاً از طریق بخش تنظیمات MCP روی «ورود با اکانت فیگما» کلیک کنید تا احراز هویت انجام شود.`
+        );
+      }
+
+      if (res.status === 429 && isFigma) {
+        throw new Error(
+          `[Figma MCP Rate Limit] سقف مجاز درخواست‌های اکانت فیگما (Rate Limit) پر شده است. می‌توانید از سرور دسکتاپ Figma در Dev Mode (http://127.0.0.1:3845/mcp) استفاده کنید که بدون محدودیت کار می‌کند.`
+        );
+      }
+
       throw new Error(`Remote MCP server '${serverName}' returned HTTP ${res.status}: ${await res.text()}`);
     }
 
