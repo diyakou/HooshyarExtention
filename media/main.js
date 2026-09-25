@@ -1,5 +1,6 @@
 (function () {
   const vscode = acquireVsCodeApi();
+  const persistedUiState = vscode.getState() || {};
   const messagesEl = document.getElementById("messages");
   const formEl = document.getElementById("input-form");
   const inputEl = document.getElementById("input");
@@ -16,6 +17,9 @@
   const sidebarNewBtn = document.getElementById("sidebar-new-btn");
   const mentionMenu = document.getElementById("mention-menu");
   const chatPane = document.getElementById("chat-pane");
+  const sidebarEl = document.getElementById("sidebar");
+  let isSidebarCollapsed = persistedUiState.sidebarCollapsed !== false;
+  sidebarEl.classList.toggle("collapsed", isSidebarCollapsed);
 
   const langBtn = document.getElementById("lang-btn");
   const helpBtn = document.getElementById("help-btn");
@@ -271,7 +275,9 @@
     "search_codebase",
     "update_tasks",
     "search_replace",
-    "run_command"
+    "run_command",
+    "run_in_terminal",
+    "task_complete"
   ];
 
   const MAX_RENDERED_MESSAGES = 150;
@@ -341,13 +347,14 @@
     const el = document.createElement("div");
     el.className = "chat-empty";
     el.innerHTML =
-      '<div class="chat-empty-title"><span>⚡</span><span>' + escapeHtml(t.chat_empty_title) + '</span></div>' +
+      '<div class="chat-empty-mark" aria-hidden="true"><span>⌁</span></div>' +
+      '<div class="chat-empty-title"><span>' + escapeHtml(t.chat_empty_title) + '</span></div>' +
       '<p class="chat-empty-subtitle">' + escapeHtml(t.chat_empty_subtitle) + '</p>' +
       '<div class="prompt-chips">' +
-      '<button type="button" class="prompt-chip" data-prompt="' + escapeHtml(t.prompt_chip_1_prompt) + '"><span class="chip-icon">🔍</span><span>' + escapeHtml(t.prompt_chip_1_label) + '</span></button>' +
-      '<button type="button" class="prompt-chip" data-prompt="' + escapeHtml(t.prompt_chip_2_prompt) + '"><span class="chip-icon">🛠️</span><span>' + escapeHtml(t.prompt_chip_2_label) + '</span></button>' +
-      '<button type="button" class="prompt-chip" data-prompt="' + escapeHtml(t.prompt_chip_3_prompt) + '"><span class="chip-icon">📝</span><span>' + escapeHtml(t.prompt_chip_3_label) + '</span></button>' +
-      '<button type="button" class="prompt-chip" data-prompt="' + escapeHtml(t.prompt_chip_4_prompt) + '"><span class="chip-icon">💡</span><span>' + escapeHtml(t.prompt_chip_4_label) + '</span></button>' +
+      '<button type="button" class="prompt-chip" data-prompt="' + escapeHtml(t.prompt_chip_1_prompt) + '"><span class="chip-icon">⌕</span><span>' + escapeHtml(t.prompt_chip_1_label) + '</span></button>' +
+      '<button type="button" class="prompt-chip" data-prompt="' + escapeHtml(t.prompt_chip_2_prompt) + '"><span class="chip-icon">⌘</span><span>' + escapeHtml(t.prompt_chip_2_label) + '</span></button>' +
+      '<button type="button" class="prompt-chip" data-prompt="' + escapeHtml(t.prompt_chip_3_prompt) + '"><span class="chip-icon">□</span><span>' + escapeHtml(t.prompt_chip_3_label) + '</span></button>' +
+      '<button type="button" class="prompt-chip" data-prompt="' + escapeHtml(t.prompt_chip_4_prompt) + '"><span class="chip-icon">✦</span><span>' + escapeHtml(t.prompt_chip_4_label) + '</span></button>' +
       '</div>';
     messagesEl.appendChild(el);
   }
@@ -361,7 +368,7 @@
   // when a tag is only partially received.
   function sanitizeAssistantText(text) {
     if (!text) return "";
-    let out = text;
+    let out = text.replace(/\[hooshyar_task_complete\]/g, "");
     // Strip thinking tags and any stray single '>' that immediately follows them
     out = out.replace(/<thinking_mode>[\s\S]*?<\/thinking_mode>\s*>?[ \t]*/gi, "");
     out = out.replace(/<think>[\s\S]*?<\/think>\s*>?[ \t]*/gi, "");
@@ -501,9 +508,23 @@
   }
 
   function displayUserText(raw) {
-    const marker = "---\n\n";
-    const idx = raw.lastIndexOf(marker);
-    return idx >= 0 ? raw.slice(idx + marker.length).trim() : raw;
+    const requestMarker = "[hooshyar_user_request]";
+    const taggedIndex = raw.lastIndexOf(requestMarker);
+    if (taggedIndex >= 0) {
+      return raw.slice(taggedIndex + requestMarker.length).trim();
+    }
+    if (/\[(?:environment_details|Initial Markdown context|Markdown file:|Active file:)/i.test(raw)) {
+      const environmentEnd = raw.lastIndexOf("[/environment_details]");
+      const fenceEnd = raw.lastIndexOf("```");
+      const contextEnd = Math.max(
+        environmentEnd >= 0 ? environmentEnd + "[/environment_details]".length : -1,
+        fenceEnd >= 0 ? fenceEnd + 3 : -1
+      );
+      const trailingText = contextEnd >= 0 ? raw.slice(contextEnd).trim() : "";
+      if (trailingText) return trailingText;
+    }
+    const legacyParts = raw.split(/\r?\n---\r?\n\r?\n/);
+    return (legacyParts.length > 1 ? legacyParts[legacyParts.length - 1] : raw).trim();
   }
 
   function isPersianText(text) {
@@ -592,7 +613,8 @@
     search_replace: { icon: "✂️", verb: "ویرایش قطعه‌کد", enVerb: "Patch code" },
     update_tasks: { icon: "📋", verb: "به‌روزرسانی نقشه اقدام", enVerb: "Update plan" },
     run_command: { icon: "▶️", verb: "اجرای دستور ترمینال", enVerb: "Run command" },
-    run_in_terminal: { icon: "💻", verb: "ارسال به ترمینال ادیتور", enVerb: "Run in VS Code terminal" }
+    run_in_terminal: { icon: "💻", verb: "ارسال به ترمینال ادیتور", enVerb: "Run in VS Code terminal" },
+    task_complete: { icon: "✓", verb: "تکمیل کار", enVerb: "Complete task" }
   };
 
   function getToolTargetChip(name, input) {
@@ -660,7 +682,8 @@
       this.cardEl.className = "agent-activity-card " + (isHistory ? "completed collapsed" : "running");
 
       // Header
-      this.headerEl = document.createElement("div");
+      this.headerEl = document.createElement("button");
+      this.headerEl.type = "button";
       this.headerEl.className = "agent-activity-header";
       this.headerEl.title = currentLang === "fa" ? "کلیک برای مشاهده جزئیات عملیات" : "Click to toggle activity details";
 
@@ -695,6 +718,7 @@
       headerMeta.appendChild(chevron);
       this.headerEl.appendChild(headerMain);
       this.headerEl.appendChild(headerMeta);
+      this.headerEl.setAttribute("aria-expanded", String(!this.cardEl.classList.contains("collapsed")));
 
       // Body
       this.bodyEl = document.createElement("div");
@@ -709,11 +733,19 @@
 
       // Header click toggles collapse
       this.headerEl.addEventListener("click", () => {
-        this.cardEl.classList.toggle("collapsed");
+        this.setExpanded(this.cardEl.classList.contains("collapsed"), true);
       });
 
       messagesEl.appendChild(this.cardEl);
       scrollToBottom();
+    }
+
+    setExpanded(expanded, keepHeaderVisible = false) {
+      this.cardEl.classList.toggle("collapsed", !expanded);
+      this.headerEl.setAttribute("aria-expanded", String(expanded));
+      if (expanded && keepHeaderVisible) {
+        requestAnimationFrame(() => this.headerEl.scrollIntoView({ block: "start" }));
+      }
     }
 
     addStep(id, name, input) {
@@ -741,6 +773,9 @@
       const summaryRow = document.createElement("div");
       summaryRow.className = "step-summary-row";
       summaryRow.title = "کلیک برای مشاهده جزئیات ورودی/خروجی";
+      summaryRow.setAttribute("role", "button");
+      summaryRow.setAttribute("tabindex", "0");
+      summaryRow.setAttribute("aria-expanded", "false");
 
       const icon = document.createElement("span");
       icon.className = "step-icon";
@@ -879,8 +914,16 @@
       stepEl.appendChild(indicator);
       stepEl.appendChild(main);
 
-      summaryRow.addEventListener("click", () => {
-        stepEl.classList.toggle("collapsed");
+      const toggleStep = () => {
+        const expanded = stepEl.classList.contains("collapsed");
+        stepEl.classList.toggle("collapsed", !expanded);
+        summaryRow.setAttribute("aria-expanded", String(expanded));
+      };
+      summaryRow.addEventListener("click", toggleStep);
+      summaryRow.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        toggleStep();
       });
 
       this.stepListEl.appendChild(stepEl);
@@ -930,7 +973,7 @@
       const total = this.steps.length;
       const done = this.steps.filter((s) => s.isCompleted).length;
 
-      this.badgeEl.textContent = `${total} مرحله`;
+      this.badgeEl.textContent = String(total);
 
       if (!this.isCompleted) {
         if (lastToolName) {
@@ -955,24 +998,12 @@
       }
 
       const isFa = currentLang === "fa";
-      if (this.hasError) {
-        this.statusIconEl.textContent = "⚠";
-        this.titleEl.textContent = isFa
-          ? `${total} عملیات انجام شد (همراه با خطا)`
-          : `${total} operations completed (with errors)`;
-      } else {
-        this.statusIconEl.textContent = "✓";
-        this.titleEl.textContent = isFa
-          ? `${total} عملیات با موفقیت در پروژه انجام شد`
-          : `${total} operations completed on workspace`;
-      }
-      this.badgeEl.textContent = isFa ? `${total} مرحله` : `${total} steps`;
-
-      if (!this.hasError) {
-        this.cardEl.classList.add("collapsed");
-      } else {
-        this.cardEl.classList.remove("collapsed");
-      }
+      this.statusIconEl.textContent = this.hasError ? "⚠" : "✓";
+      this.titleEl.textContent = this.hasError
+        ? (isFa ? "فعالیت‌ها با خطا پایان یافت" : "Activity completed with errors")
+        : (isFa ? "کارهای انجام‌شده" : "Work completed");
+      this.badgeEl.textContent = String(total);
+      this.setExpanded(this.hasError);
     }
   }
 
@@ -1079,6 +1110,14 @@
     for (const m of messages || []) {
       if (m.role === "user") {
         const text = userTextFromContent(m.content);
+        if (text.startsWith("[Auto-compacted context")) {
+          if (pendingHistoryCard) {
+            pendingHistoryCard.finalize();
+            pendingHistoryCard = null;
+          }
+          renderContextCompactCard(text);
+          continue;
+        }
         const images =
           Array.isArray(m.content) ? m.content.filter((b) => b.type === "image") : [];
         const isToolResults =
@@ -1178,6 +1217,29 @@
     scrollToBottom();
   }
 
+  function renderContextCompactCard(text, stats) {
+    clearChatEmpty();
+    const details = document.createElement("details");
+    details.className = "context-compact-card";
+    const summary = document.createElement("summary");
+    summary.textContent = stats
+      ? `Context compacted · ${formatTokens(stats.beforeTokens)} → ${formatTokens(stats.afterTokens)} tokens`
+      : "Context compacted · older turns summarized";
+    details.appendChild(summary);
+    if (text) {
+      const body = document.createElement("div");
+      body.className = "context-compact-body";
+      body.innerHTML = renderMarkdown(
+        text
+          .replace(/^\[Auto-compacted context[^\]]*\]\s*/i, "")
+          .replace(/\s*\[Continue from the recent verbatim turns below\.\]\s*$/i, "")
+      );
+      details.appendChild(body);
+    }
+    messagesEl.appendChild(details);
+    scrollToBottom();
+  }
+
   function addMessageActions(wrap, text) {
     const actions = document.createElement("div");
     actions.className = "msg-actions";
@@ -1261,11 +1323,9 @@
 
   function renderSessionList(sessions, currentId) {
     currentSessionId = currentId || "";
-    const sidebar = document.getElementById("sidebar");
     sessionListEl.innerHTML = "";
 
     if (!sessions || sessions.length === 0) {
-      sidebar.classList.add("collapsed");
       const empty = document.createElement("div");
       empty.className = "session-empty";
       empty.textContent = "No saved chats yet";
@@ -1273,7 +1333,6 @@
       return;
     }
 
-    sidebar.classList.remove("collapsed");
     for (const s of sessions) {
       const row = document.createElement("div");
       row.className = "session-row" + (s.id === currentId ? " active" : "");
@@ -1788,7 +1847,9 @@
   });
 
   document.getElementById("sidebar-toggle").addEventListener("click", () => {
-    document.getElementById("sidebar").classList.toggle("collapsed");
+    isSidebarCollapsed = !isSidebarCollapsed;
+    sidebarEl.classList.toggle("collapsed", isSidebarCollapsed);
+    vscode.setState({ ...(vscode.getState() || {}), sidebarCollapsed: isSidebarCollapsed });
   });
 
   attachBtn.addEventListener("click", () => {
@@ -1877,6 +1938,9 @@
           ")";
         break;
       }
+      case "contextCompacted":
+        renderContextCompactCard("", msg);
+        break;
       case "sessions":
         renderSessionList(msg.sessions, msg.currentId);
         break;
@@ -2096,6 +2160,15 @@
           .join("");
         break;
       }
+      case "skillsAdded": {
+        configuredSkills = Array.isArray(msg.skills) ? msg.skills : configuredSkills;
+        renderSkills();
+        if (skillsStatus) {
+          skillsStatus.className = "test-status ok";
+          skillsStatus.textContent = "✓ " + msg.message;
+        }
+        break;
+      }
       case "followUpPills": {
         renderFollowUpPills(msg.pills);
         break;
@@ -2140,12 +2213,48 @@
   const cfgAutoApproveCommands = document.getElementById("cfg-auto-approve-commands");
   const cfgAutoApproveMode = document.getElementById("cfg-auto-approve-mode");
   const cfgAutoIncludeActive = document.getElementById("cfg-auto-include-active");
+  const cfgAutoCompact = document.getElementById("cfg-auto-compact");
   const cfgDebugLogging = document.getElementById("cfg-debug-logging");
   const cfgMcpServers = document.getElementById("cfg-mcp-servers");
+  const skillsList = document.getElementById("skills-list");
+  const addSkillBtn = document.getElementById("add-skill-btn");
+  const skillsStatus = document.getElementById("skills-status");
   const testMcpBtn = document.getElementById("test-mcp-btn");
   const testMcpStatus = document.getElementById("test-mcp-status");
   const copyLogsBtn = document.getElementById("copy-logs-btn");
   const showLogsBtn = document.getElementById("show-logs-btn");
+  let configuredSkills = [];
+
+  function renderSkills() {
+    if (!skillsList) return;
+    skillsList.innerHTML = "";
+    if (configuredSkills.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "skills-empty";
+      empty.textContent = "No skills added";
+      skillsList.appendChild(empty);
+      return;
+    }
+    configuredSkills.forEach((skill, index) => {
+      const row = document.createElement("div");
+      row.className = "skill-row";
+      const label = document.createElement("span");
+      label.className = "skill-path";
+      label.textContent = typeof skill === "string" ? skill : (skill.name || skill.path);
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "skill-remove-btn";
+      remove.title = "Remove skill";
+      remove.textContent = "×";
+      remove.addEventListener("click", () => {
+        configuredSkills.splice(index, 1);
+        renderSkills();
+      });
+      row.appendChild(label);
+      row.appendChild(remove);
+      skillsList.appendChild(row);
+    });
+  }
 
   function openSettingsModal() {
     vscode.postMessage({ type: "getSettings" });
@@ -2159,6 +2268,10 @@
     if (testMcpStatus) {
       testMcpStatus.textContent = "";
       testMcpStatus.className = "test-status";
+    }
+    if (skillsStatus) {
+      skillsStatus.textContent = "";
+      skillsStatus.className = "test-status";
     }
   }
 
@@ -2180,6 +2293,9 @@
     if (cfgAutoApproveCommands) cfgAutoApproveCommands.checked = Boolean(s.autoApproveCommands);
     if (cfgAutoApproveMode) cfgAutoApproveMode.value = s.autoApproveMode || "off";
     if (cfgAutoIncludeActive) cfgAutoIncludeActive.checked = s.autoIncludeActiveFile ?? true;
+    if (cfgAutoCompact) cfgAutoCompact.checked = Boolean(s.experimentalAutoCompact);
+    configuredSkills = Array.isArray(s.skills) ? s.skills.slice() : [];
+    renderSkills();
     if (cfgDebugLogging) cfgDebugLogging.checked = Boolean(s.debugLogging);
     if (cfgMcpServers) cfgMcpServers.value = s.mcpServers || "{}";
     settingsModal.classList.remove("hidden");
@@ -2256,6 +2372,19 @@
     });
   }
 
+  if (addSkillBtn) {
+    addSkillBtn.addEventListener("click", () => {
+      if (skillsStatus) {
+        skillsStatus.className = "test-status testing";
+        skillsStatus.textContent = "Select skill files...";
+      }
+      vscode.postMessage({
+        type: "addSkills",
+        existingSkills: configuredSkills
+      });
+    });
+  }
+
   if (saveSettingsBtn) {
     saveSettingsBtn.addEventListener("click", () => {
       testConnStatus.className = "test-status testing";
@@ -2277,6 +2406,8 @@
           autoApproveMode: cfgAutoApproveMode ? cfgAutoApproveMode.value : "off",
           requireApprovalForCommands: cfgAutoApproveCommands ? !cfgAutoApproveCommands.checked : true,
           autoIncludeActiveFile: cfgAutoIncludeActive ? cfgAutoIncludeActive.checked : true,
+          experimentalAutoCompact: cfgAutoCompact ? cfgAutoCompact.checked : false,
+          skills: configuredSkills,
           debugLogging: cfgDebugLogging ? cfgDebugLogging.checked : false,
           mcpServers: cfgMcpServers ? cfgMcpServers.value.trim() : "{}"
         }

@@ -133,6 +133,12 @@ export interface ChatSessionMeta {
   mode?: ChatMode;
 }
 
+export type SkillReference = string | {
+  path: string;
+  name?: string;
+  enabled?: boolean;
+};
+
 export interface SettingsData {
   apiFormat: "anthropic" | "openai";
   baseUrl: string;
@@ -145,11 +151,13 @@ export interface SettingsData {
   enableShellTool: boolean;
   /** JSON object of stdio MCP servers; values contain command, args, env, and optional disabled. */
   mcpServers: string;
+  skills: SkillReference[];
   requireApprovalForWrites: boolean;
   autoApproveCommands?: boolean;
   autoApproveMode?: "off" | "safe" | "all";
   requireApprovalForCommands?: boolean;
   autoIncludeActiveFile: boolean;
+  experimentalAutoCompact: boolean;
   debugLogging: boolean;
 }
 
@@ -167,6 +175,7 @@ export type ExtensionToWebviewMessage =
   | { type: "filesAttached"; files: string[] }
   | { type: "attachmentsUpdated"; files: string[]; images: AttachmentPreview[] }
   | { type: "usage"; inputTokens: number; outputTokens: number }
+  | { type: "contextCompacted"; beforeTokens: number; afterTokens: number }
   | { type: "sessions"; sessions: ChatSessionMeta[]; currentId: string }
   | { type: "agentWorking"; active: boolean; statusText?: string }
   | { type: "promptProcessing"; text?: string }
@@ -180,6 +189,7 @@ export type ExtensionToWebviewMessage =
   | { type: "liveToolStop"; id: string; name: string; input: Record<string, unknown> }
   | { type: "modeChanged"; mode: ChatMode }
   | { type: "testMcpServersResult"; statuses: { name: string; ok: boolean; message: string; tools: string[] }[] }
+  | { type: "skillsAdded"; skills: SkillReference[]; message: string }
   | { type: "followUpPills"; pills: string[] }
   | { type: "sessionReviewUpdate"; files: string[] }
   | { type: "searchWorkspaceFilesResult"; query: string; files: string[] };
@@ -212,6 +222,7 @@ export type WebviewToExtensionMessage =
   | { type: "saveSettings"; settings: Partial<SettingsData> }
   | { type: "testConnection"; tempSettings?: Partial<SettingsData> }
   | { type: "testMcpServers"; rawMcpServers?: string }
+  | { type: "addSkills"; existingSkills: SkillReference[] }
   | { type: "openSettingsModal" }
   | { type: "copyLogs" }
   | { type: "showLogs" }

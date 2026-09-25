@@ -6,7 +6,7 @@ export function estimateTokens(text: string): number {
   return Math.ceil(text.length / APPROX_CHARS_PER_TOKEN);
 }
 
-function messageCharLength(msg: Message): number {
+export function messageCharLength(msg: Message): number {
   if (typeof msg.content === "string") return msg.content.length;
   return msg.content
     .map((b) => {
@@ -17,6 +17,77 @@ function messageCharLength(msg: Message): number {
       return 0;
     })
     .reduce((a, b) => a + b, 0);
+}
+
+export function historyCharLength(messages: Message[]): number {
+  return messages.reduce((sum, message) => sum + messageCharLength(message), 0);
+}
+
+export interface ContextCompactionPlan {
+  olderMessages: Message[];
+  recentMessages: Message[];
+  originalChars: number;
+  compactedChars: number;
+}
+
+/**
+ * Splits history on atomic tool boundaries. Recent context is kept verbatim while
+ * older turns are handed to the model for summarization.
+ */
+export function planContextCompaction(
+  messages: Message[],
+  keepRecentChars: number
+): ContextCompactionPlan | undefined {
+  const chunks = groupIntoAtomicChunks(messages);
+  if (chunks.length < 4) return undefined;
+
+  const recentChunks: Message[][] = [];
+  let recentChars = 0;
+  let splitIndex = chunks.length;
+
+  for (let i = chunks.length - 1; i >= 0; i--) {
+    const chunkChars = chunks[i].reduce((sum, message) => sum + messageCharLength(message), 0);
+    if (recentChunks.length >= 2 && recentChars + chunkChars > keepRecentChars) break;
+    recentChunks.unshift(chunks[i]);
+    recentChars += chunkChars;
+    splitIndex = i;
+  }
+
+  if (splitIndex < 2) return undefined;
+
+  const olderMessages = chunks.slice(0, splitIndex).flat();
+  const recentMessages = recentChunks.flat();
+  if (olderMessages.length < 2 || recentMessages.length < 1) return undefined;
+
+  return {
+    olderMessages,
+    recentMessages,
+    originalChars: historyCharLength(messages),
+    compactedChars: historyCharLength(olderMessages)
+  };
+}
+
+export function historyToCompactionText(messages: Message[]): string {
+  return messages.map((message, index) => {
+    const role = message.role.toUpperCase();
+    if (typeof message.content === "string") {
+      return `[${index + 1}] ${role}\n${message.content}`;
+    }
+
+    const blocks = message.content.map((block) => {
+      if (block.type === "text") return block.text;
+      if (block.type === "image") return `[attached image: ${block.source.media_type}]`;
+      if (block.type === "tool_use") {
+        return `[tool call: ${block.name}]\n${JSON.stringify(block.input)}`;
+      }
+      if (block.type === "tool_result") {
+        const status = block.is_error ? "error" : "result";
+        return `[tool ${status}: ${block.tool_use_id}]\n${block.content}`;
+      }
+      return "";
+    });
+    return `[${index + 1}] ${role}\n${blocks.join("\n")}`;
+  }).join("\n\n");
 }
 
 export function isToolResultUserMessage(msg: Message): boolean {

@@ -252,7 +252,8 @@ export class McpManager {
 
   public async testServer(serverName: string, config: McpServerConfig): Promise<{ ok: boolean; message: string; tools: string[] }> {
     try {
-      this.cleanupServer(serverName);
+      // Validate through the same live connection used by tool calls. Restarting here can
+      // interrupt an active agent turn and makes slow stdio servers time out during startup.
       await this.listTools({ [serverName]: config });
       const status = this.serverStatuses.get(serverName);
       if (!status || status.status !== "connected") {

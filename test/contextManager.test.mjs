@@ -7,7 +7,10 @@ import {
   isToolResultUserMessage,
   hasToolUse,
   compactHistoricalToolResults,
-  compactToolResultText
+  compactToolResultText,
+  historyCharLength,
+  historyToCompactionText,
+  planContextCompaction
 } from "../out/contextManager.js";
 
 test("Atomic Context Manager Tests", async (t) => {
@@ -167,5 +170,43 @@ test("Atomic Context Manager Tests", async (t) => {
     assert.ok(t2Msg.content[0].content.length < 500);
     assert.match(t2Msg.content[0].content, /characters omitted from earlier turn/);
   });
-});
 
+  await t.test("planContextCompaction preserves recent tool pairs and selects older turns", () => {
+    const messages = [
+      { role: "user", content: "Initial task " + "a".repeat(500) },
+      { role: "assistant", content: "Initial answer " + "b".repeat(500) },
+      { role: "user", content: "Follow-up " + "c".repeat(500) },
+      { role: "assistant", content: [{ type: "tool_use", id: "latest", name: "read_file", input: { path: "a.ts" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "latest", content: "recent result" }] }
+    ];
+
+    const plan = planContextCompaction(messages, 250);
+    assert.ok(plan);
+    assert.ok(plan.olderMessages.length >= 2);
+    assert.equal(plan.recentMessages.length, 3);
+    assert.equal(hasToolUse(plan.recentMessages[1]), true);
+    assert.equal(isToolResultUserMessage(plan.recentMessages[2]), true);
+    assert.equal(plan.originalChars, historyCharLength(messages));
+  });
+
+  await t.test("historyToCompactionText excludes image data while retaining tool facts", () => {
+    const transcript = historyToCompactionText([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Inspect this" },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "SECRET_BASE64" } }
+        ]
+      },
+      {
+        role: "assistant",
+        content: [{ type: "tool_use", id: "t1", name: "read_file", input: { path: "src/a.ts" } }]
+      }
+    ]);
+
+    assert.match(transcript, /Inspect this/);
+    assert.match(transcript, /attached image: image\/png/);
+    assert.match(transcript, /read_file/);
+    assert.doesNotMatch(transcript, /SECRET_BASE64/);
+  });
+});

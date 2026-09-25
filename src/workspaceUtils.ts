@@ -31,6 +31,7 @@ export interface EnvironmentPlatformInfo {
   platform: string;
   shell: string;
   shellPath: string;
+  shellFamily: "powershell" | "cmd" | "posix";
   isWindows: boolean;
 }
 
@@ -41,13 +42,39 @@ export function getEnvironmentPlatformInfo(): EnvironmentPlatformInfo {
     (typeof vscode !== "undefined" && vscode.env?.shell) ||
     (isWindows ? process.env.ComSpec || "powershell.exe" : process.env.SHELL || "/bin/bash");
   const shell = path.basename(shellPath).replace(/\.exe$/i, "").toLowerCase();
+  const shellFamily = isWindows
+    ? /^(?:powershell|pwsh)$/.test(shell) ? "powershell" : "cmd"
+    : "posix";
   return {
     os,
     platform: process.platform,
     shell,
     shellPath,
+    shellFamily,
     isWindows
   };
+}
+
+export function buildHostCommandGuidance(info: EnvironmentPlatformInfo): string {
+  const heading = `Host OS is ${info.os} (${info.platform}); active terminal shell is ${info.shell} (${info.shellPath}).`;
+  if (info.shellFamily === "powershell") {
+    return (
+      `${heading} Generate PowerShell commands only, not Linux/bash or CMD syntax. ` +
+      "Use Get-ChildItem, Get-Content, Remove-Item, New-Item, Get-Command, $env:NAME='value', and " +
+      ".\\.venv\\Scripts\\Activate.ps1. Prefer cross-platform project commands such as npm, node, python, and git."
+    );
+  }
+  if (info.shellFamily === "cmd") {
+    return (
+      `${heading} Generate Windows CMD commands only, not Linux/bash or PowerShell syntax. ` +
+      "Use dir, type, del/rmdir, where, set NAME=value, and call .venv\\Scripts\\activate.bat. " +
+      "Prefer cross-platform project commands such as npm, node, python, and git."
+    );
+  }
+  return (
+    `${heading} Generate POSIX commands compatible with ${info.shell}; do not output PowerShell or CMD syntax. ` +
+    "Prefer portable project commands such as npm, node, python, git, and standard POSIX utilities."
+  );
 }
 
 export function getTargetWorkspaceFolder(targetPath?: string): vscode.WorkspaceFolder {

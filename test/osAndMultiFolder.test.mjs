@@ -1,17 +1,22 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  buildHostCommandGuidance,
   getEnvironmentPlatformInfo,
   normalizeFsPath,
   isSubpath
 } from "../out/workspaceUtils.js";
 import {
+  normalizeCommandForHost,
   normalizeWindowsCommand,
   assertSafeCommand
 } from "../out/tools.js";
 import {
   buildSystemPrompt,
-  buildEnvironmentDetails
+  buildEnvironmentDetails,
+  composeUserMessage,
+  getDisplayUserMessageText,
+  getLastUserMessageText
 } from "../out/messageNormalizer.js";
 
 test("OS & Terminal Compatibility Tests", async (t) => {
@@ -41,6 +46,49 @@ test("OS & Terminal Compatibility Tests", async (t) => {
     }
   });
 
+  await t.test("normalizes generated commands for the exact Windows shell", () => {
+    const powershell = {
+      os: "Windows",
+      platform: "win32",
+      shell: "pwsh",
+      shellPath: "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+      shellFamily: "powershell",
+      isWindows: true
+    };
+    const cmd = {
+      ...powershell,
+      shell: "cmd",
+      shellPath: "C:\\Windows\\System32\\cmd.exe",
+      shellFamily: "cmd"
+    };
+
+    assert.equal(normalizeCommandForHost("export PORT=3000", powershell), "$env:PORT='3000'");
+    assert.equal(normalizeCommandForHost("which node && ls -la", powershell), "Get-Command node && Get-ChildItem -Force");
+    assert.equal(
+      normalizeCommandForHost("source .venv/bin/activate", powershell),
+      '& ".venv\\Scripts\\Activate.ps1"'
+    );
+    assert.equal(normalizeCommandForHost("export PORT=3000", cmd), "set PORT=3000");
+    assert.equal(normalizeCommandForHost("which node && ls -la", cmd), "where node && dir /a");
+    assert.equal(
+      normalizeCommandForHost("source .venv/bin/activate", cmd),
+      "call .venv\\Scripts\\activate.bat"
+    );
+  });
+
+  await t.test("host command guidance names the detected shell family", () => {
+    const powershellGuidance = buildHostCommandGuidance({
+      os: "Windows",
+      platform: "win32",
+      shell: "powershell",
+      shellPath: "powershell.exe",
+      shellFamily: "powershell",
+      isWindows: true
+    });
+    assert.match(powershellGuidance, /Generate PowerShell commands only/);
+    assert.match(powershellGuidance, /not Linux\/bash or CMD/);
+  });
+
   await t.test("assertSafeCommand allows safe variables while blocking command injection", () => {
     assert.doesNotThrow(() => assertSafeCommand("echo $env:PATH"));
     assert.doesNotThrow(() => assertSafeCommand("echo $PORT"));
@@ -64,5 +112,20 @@ test("OS & Terminal Compatibility Tests", async (t) => {
     assert.ok(env.includes("[environment_details]"));
     assert.ok(env.includes("Operating System:"));
     assert.ok(env.includes("Terminal Shell:"));
+  });
+
+  await t.test("user message display excludes automatically attached context", () => {
+    const content = composeUserMessage(
+      ["[environment_details]\nOS: macOS\n[/environment_details]", "[Markdown file: README.md]\nSupported Versions"],
+      "سلام"
+    );
+
+    assert.equal(getDisplayUserMessageText(content), "سلام");
+    assert.equal(getLastUserMessageText([{ role: "user", content }]), "سلام");
+
+    const legacyContent =
+      "[environment_details]\nOS: macOS\n[/environment_details]\n\n---\n\n" +
+      "[Initial Markdown context]\n[Markdown file: README.md]\n```md\n## Supported Versions\n```سلام";
+    assert.equal(getDisplayUserMessageText(legacyContent), "سلام");
   });
 });

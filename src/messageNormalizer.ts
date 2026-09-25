@@ -5,8 +5,18 @@ import { listWorkspaceRootsSummary } from "./tools";
 import { getActiveFileSymbolsContext, getGitDiffContext } from "./contextProviders";
 import { loadProjectRules } from "./rulesLoader";
 import { resolveMentionsToContext } from "./mentionResolver";
-import { isSubpath, normalizeFsPath, readTextFile, resolveWorkspaceUri, getEnvironmentPlatformInfo } from "./workspaceUtils";
+import {
+  buildHostCommandGuidance,
+  isSubpath,
+  normalizeFsPath,
+  readTextFile,
+  resolveWorkspaceUri,
+  getEnvironmentPlatformInfo
+} from "./workspaceUtils";
 import { MemoryManager } from "./memoryManager";
+import { loadSkills } from "./skillsManager";
+
+export const USER_REQUEST_MARKER = "[hooshyar_user_request]";
 
 export async function buildContextPrefix(
   pendingAttachments: AttachedFile[],
@@ -171,22 +181,21 @@ export async function buildSystemPrompt(basePrompt: string): Promise<string> {
   const osTerminalSection =
     "\n\n## HOST ENVIRONMENT & TERMINAL COMMAND RULES (STRICT)\n" +
     `- Operating System: ${envInfo.os} (${envInfo.platform})\n` +
-    `- Active Shell: ${envInfo.shell}\n` +
+    `- Active Shell: ${envInfo.shell} (${envInfo.shellPath})\n` +
+    `- ${buildHostCommandGuidance(envInfo)}\n` +
     (envInfo.isWindows
-      ? "- CRITICAL WINDOWS COMMAND RULES: The user is running on Windows. You MUST generate commands that work natively in Windows / PowerShell / CMD.\n" +
-        "  * NEVER generate Linux-only commands such as `ls -la`, `cat`, `grep`, `rm -rf`, `export VAR=val`, `source venv/bin/activate`, `touch`, `chmod`.\n" +
-        "  * For directory listing in terminal, use `dir` or `Get-ChildItem` (or use the list_files / list_codebase tool).\n" +
-        "  * For reading files in terminal, use `type` or `Get-Content` (or prefer the read_file tool).\n" +
-        "  * For file removal, use `del` or `Remove-Item`, and `rmdir /s /q` or `Remove-Item -Recurse` instead of `rm -rf`.\n" +
-        "  * For environment variables, use `set VAR=val` (CMD) or `$env:VAR='val'` (PowerShell) instead of `export`.\n" +
-        "  * Activate python virtual environments with `.\\venv\\Scripts\\activate` or `.\\.venv\\Scripts\\activate` (do NOT use `source`).\n" +
-        "  * Prefer cross-platform project scripts like `npm test`, `npm run compile`, `python -m pytest`, `node script.js`.\n" +
-        "  * Forward slashes `/` and backslashes `\\` are both supported in tool paths."
-      : `- Standard UNIX/POSIX shell syntax compatible with ${envInfo.os} and ${envInfo.shell}.`);
+      ? "- CRITICAL WINDOWS COMMAND RULES: NEVER generate Linux-only commands such as `ls -la`, `cat`, `grep`, `rm -rf`, `export VAR=val`, `source venv/bin/activate`, `touch`, or `chmod`. Do not mix PowerShell and CMD syntax.\n" +
+        "- Before emitting run_command or run_in_terminal, verify every command against the Active Shell above."
+      : "- Before emitting run_command or run_in_terminal, verify every command uses the Active Shell syntax above.");
 
   const workspaceInfo = `\n\n## CURRENT WORKSPACE\ncurrent working directory is: ${rootsSummary}\nActive workspace folder(s):\n${rootsSummary}${multiFolderNotice}`;
-  const rules = await loadProjectRules();
+  const [rules, skills] = await Promise.all([loadProjectRules(), loadSkills()]);
   const rulesText = rules.trim() ? `\n\n## PROJECT RULES\n${rules}` : "";
+  const skillsText = skills.trim()
+    ? "\n\n## AVAILABLE SKILLS\n" +
+      "Apply a skill only when the request clearly matches its domain. Skills provide reusable expertise and are independent from MCP tools; " +
+      "use relevant skills and MCP tools together when the task needs both. Skill examples are guidance, not pending user requests.\n\n" + skills
+    : "";
   const memoryText = MemoryManager.getInstance().formatForSystemPrompt();
   const memorySection = memoryText.trim() ? `\n\n${memoryText.trim()}` : "";
   const planningInstructions = basePrompt.includes("AGENT MODE")
@@ -197,7 +206,7 @@ export async function buildSystemPrompt(basePrompt: string): Promise<string> {
       "CRITICAL: Once you start executing a plan, DO NOT stop after step 1! Execute each step sequentially using your tools until ALL tasks in your task list are marked completed. " +
       "Do NOT stop or ask for user confirmation between routine steps of your plan. Read `.hooshyar/PLAN.md` before acting on new requests so unfinished work is continued."
     : "";
-  return `${basePrompt}${workspaceInfo}${osTerminalSection}${rulesText}${memorySection}${planningInstructions}`;
+  return `${basePrompt}${workspaceInfo}${osTerminalSection}${rulesText}${skillsText}${memorySection}${planningInstructions}`;
 }
 
 async function buildInitialMarkdownContext(): Promise<string> {
@@ -245,6 +254,37 @@ export async function buildUserMessagePrefix(text: string, isFirstMessage: boole
   return prefix;
 }
 
+export function composeUserMessage(contextParts: string[], text: string): string {
+  const prefix = contextParts
+    .map((part) => part.trim().replace(/(?:\r?\n)?---\s*$/, "").trim())
+    .filter(Boolean)
+    .join("\n\n---\n\n");
+
+  return prefix ? `${prefix}\n\n${USER_REQUEST_MARKER}\n${text}` : text;
+}
+
+export function getDisplayUserMessageText(raw: string): string {
+  const taggedIndex = raw.lastIndexOf(USER_REQUEST_MARKER);
+  if (taggedIndex >= 0) {
+    return raw.slice(taggedIndex + USER_REQUEST_MARKER.length).trim();
+  }
+
+  // Backwards compatibility for sessions saved before user requests had an explicit marker.
+  if (/\[(?:environment_details|Initial Markdown context|Markdown file:|Active file:)/i.test(raw)) {
+    const environmentEnd = raw.lastIndexOf("[/environment_details]");
+    const fenceEnd = raw.lastIndexOf("```");
+    const contextEnd = Math.max(
+      environmentEnd >= 0 ? environmentEnd + "[/environment_details]".length : -1,
+      fenceEnd >= 0 ? fenceEnd + 3 : -1
+    );
+    const trailingText = contextEnd >= 0 ? raw.slice(contextEnd).trim() : "";
+    if (trailingText) return trailingText;
+  }
+
+  const legacyParts = raw.split(/\r?\n---\r?\n\r?\n/);
+  return (legacyParts.length > 1 ? legacyParts[legacyParts.length - 1] : raw).trim();
+}
+
 export function getLastUserMessageText(history: { role: string; content: unknown }[]): string {
   for (let i = history.length - 1; i >= 0; i--) {
     const m = history[i];
@@ -264,10 +304,7 @@ export function getLastUserMessageText(history: { role: string; content: unknown
       continue;
     }
 
-    const marker = "---\n\n";
-    const idx = t.lastIndexOf(marker);
-    if (idx >= 0) t = t.slice(idx + marker.length);
-    const trimmed = t.trim();
+    const trimmed = getDisplayUserMessageText(t);
     if (trimmed) return trimmed;
   }
   return "";

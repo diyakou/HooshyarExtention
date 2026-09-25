@@ -29,6 +29,12 @@ Module.prototype.require = function (id) {
       },
       window: {
         terminals: [],
+        createOutputChannel: () => ({
+          appendLine: () => {},
+          clear: () => {},
+          show: () => {},
+          dispose: () => {}
+        }),
         createTerminal: (name) => {
           const term = {
             name: typeof name === "string" ? name : name?.name || "Terminal",

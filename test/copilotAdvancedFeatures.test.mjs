@@ -9,7 +9,9 @@ import {
   buildToolDefinitions,
   assertSafeCommand,
   runInTerminalTool,
-  isMutatingTool
+  isMutatingTool,
+  isParallelSafeTool,
+  resolveCommandTimeoutMs
 } from "../out/tools.js";
 import { collectRuleFiles } from "../out/rulesLoader.js";
 import * as path from "node:path";
@@ -169,6 +171,22 @@ test("Advanced Copilot Parity Features Tests", async (t) => {
     assert.equal(isMutatingTool("read_file"), false);
   });
 
+  await t.test("only independent read tools are eligible for parallel execution", () => {
+    assert.equal(isParallelSafeTool("read_file"), true);
+    assert.equal(isParallelSafeTool("search_codebase"), true);
+    assert.equal(isParallelSafeTool("update_tasks"), false);
+    assert.equal(isParallelSafeTool("manage_memory"), false);
+    assert.equal(isParallelSafeTool("list_codebase"), false);
+    assert.equal(isParallelSafeTool("mcp_figma_get_file"), false);
+    assert.equal(isParallelSafeTool("task_complete"), false);
+  });
+
+  await t.test("command timeout is normalized to safe bounds", () => {
+    assert.equal(resolveCommandTimeoutMs(500), 1000);
+    assert.equal(resolveCommandTimeoutMs(45_000), 45_000);
+    assert.equal(resolveCommandTimeoutMs(900_000), 600_000);
+  });
+
   await t.test("assertSafeCommand allows PowerShell environment variables without throwing", () => {
     assert.doesNotThrow(() => assertSafeCommand("echo $env:NODE_ENV"));
     assert.doesNotThrow(() => assertSafeCommand("node -e 'console.log($myVar)'"));
@@ -179,6 +197,8 @@ test("Advanced Copilot Parity Features Tests", async (t) => {
     const names = tools.map((t) => t.name);
     assert.ok(names.includes("run_command"));
     assert.ok(names.includes("run_in_terminal"));
+    assert.ok(names.includes("task_complete"));
+    const runCommand = tools.find((tool) => tool.name === "run_command");
+    assert.ok(runCommand.input_schema.properties.timeout_ms);
   });
 });
-

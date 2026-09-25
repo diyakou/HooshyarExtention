@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { resolveVariables, makeMcpToolName, readMcpServers, parseMcpServersWithValidation } from "../out/mcpManager.js";
+import { McpManager, resolveVariables, makeMcpToolName, readMcpServers, parseMcpServersWithValidation } from "../out/mcpManager.js";
 import { buildToolDefinitions, executeTool, isMutatingTool } from "../out/tools.js";
 
 describe("MCP Manager tests", () => {
@@ -131,5 +131,30 @@ describe("MCP Manager tests", () => {
     assert.equal(isMutatingTool("mcp_server_execute_sql"), true);
     assert.equal(isMutatingTool("mcp_server_read_data"), false);
     assert.equal(isMutatingTool("mcp_server_query"), false);
+  });
+
+  it("tests an MCP server through its existing live connection", async () => {
+    const manager = new McpManager();
+    manager.serverStatuses.set("figma", {
+      name: "figma",
+      status: "connected",
+      toolCount: 1,
+      transport: "stdio"
+    });
+    manager.tools.set("figma", [
+      { name: "mcp_figma_get_file", description: "Get Figma file", input_schema: { type: "object" } }
+    ]);
+
+    let cleanupCalled = false;
+    manager.cleanupServer = () => {
+      cleanupCalled = true;
+    };
+    manager.listTools = async () => manager.tools.get("figma");
+
+    const result = await manager.testServer("figma", { command: "npx", args: ["figma-mcp"] });
+
+    assert.equal(cleanupCalled, false);
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.tools, ["mcp_figma_get_file"]);
   });
 });

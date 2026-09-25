@@ -4,7 +4,9 @@ import { exec } from "child_process";
 import { ToolDefinition, TaskItem } from "./types";
 import {
   DEFAULT_EXCLUDE_GLOB,
+  EnvironmentPlatformInfo,
   IgnoreMatcher,
+  buildHostCommandGuidance,
   buildWorkspaceGlob,
   getWorkspaceFolders,
   getTargetWorkspaceFolder,
@@ -182,14 +184,21 @@ export function buildToolDefinitions(opts: { enableShellTool: boolean; mcpTools?
         },
         required: ["action"]
       }
+    },
+    {
+      name: "task_complete",
+      description:
+        "Signal that an agent task is fully complete after all requested work, verification, and task-list items are finished. Call this alone, after a concise final summary.",
+      input_schema: {
+        type: "object",
+        properties: {}
+      }
     }
   ];
 
   if (opts.enableShellTool) {
     const envInfo = getEnvironmentPlatformInfo();
-    const osGuidance = envInfo.isWindows
-      ? `Host OS is Windows (${envInfo.platform}), shell is ${envInfo.shell}. Commands must be compatible with Windows/PowerShell (do NOT use Linux-specific commands like ls, cat, rm -rf, export, source, touch; use Windows/PowerShell commands or cross-platform commands like npm, python, node).`
-      : `Host OS is ${envInfo.os} (${envInfo.platform}), shell is ${envInfo.shell}. Use POSIX/Unix shell commands.`;
+    const osGuidance = buildHostCommandGuidance(envInfo);
 
     tools.push({
       name: "run_command",
@@ -205,6 +214,12 @@ export function buildToolDefinitions(opts: { enableShellTool: boolean; mcpTools?
           path: {
             type: "string",
             description: "Optional workspace-relative directory or project folder to execute the command inside. Defaults to workspace root."
+          },
+          timeout_ms: {
+            type: "number",
+            minimum: 1000,
+            maximum: 600000,
+            description: "Optional timeout in milliseconds. Defaults to the hooshyar.commandTimeoutMs setting."
           }
         },
         required: ["command"]
@@ -674,27 +689,75 @@ export function assertSafeCommand(command: string): void {
   }
 }
 
-export function normalizeWindowsCommand(command: string): string {
-  if (process.platform !== "win32") return command;
-  let cmd = command.trim();
+function quotePowerShellEnvValue(value: string): string {
+  const trimmed = value.trim();
+  if (/^(['"]).*\1$/.test(trimmed)) return trimmed;
+  return `'${trimmed.replace(/'/g, "''")}'`;
+}
 
-  // source .venv/bin/activate or source venv/bin/activate -> .venv\Scripts\activate
-  cmd = cmd.replace(/^source\s+([^\s]+)[/\\]bin[/\\]activate/i, (_m, p) => `${p}\\Scripts\\activate`);
-  // source file -> call file
+function normalizeCommandSegmentForHost(segment: string, info: EnvironmentPlatformInfo): string {
+  let cmd = segment.trim();
+  if (!info.isWindows) return cmd;
+
+  if (info.shellFamily === "powershell") {
+    cmd = cmd.replace(/^source\s+([^\s]+)[/\\]bin[/\\]activate$/i, (_m, p) =>
+      `& "${String(p).replace(/\//g, "\\")}\\Scripts\\Activate.ps1"`
+    );
+    cmd = cmd.replace(/^export\s+([A-Za-z_][A-Za-z0-9_]*)=(.*)$/i, (_m, name, value) =>
+      `$env:${name}=${quotePowerShellEnvValue(value)}`
+    );
+    cmd = cmd.replace(/^which\s+(.+)$/i, "Get-Command $1");
+    cmd = cmd.replace(/^ls\s+-la(?:\s+(.+))?$/i, (_m, target) => `Get-ChildItem -Force${target ? ` ${target}` : ""}`);
+    cmd = cmd.replace(/^cat\s+(.+)$/i, "Get-Content $1");
+    cmd = cmd.replace(/^touch\s+(.+)$/i, "New-Item -ItemType File -Force $1");
+    return cmd;
+  }
+
+  cmd = cmd.replace(/^source\s+([^\s]+)[/\\]bin[/\\]activate$/i, (_m, p) =>
+    `call ${String(p).replace(/\//g, "\\")}\\Scripts\\activate.bat`
+  );
   cmd = cmd.replace(/^source\s+/i, "call ");
-
-  // export VAR=val -> set VAR=val
   cmd = cmd.replace(/^export\s+([A-Za-z_][A-Za-z0-9_]*=)/i, "set $1");
-
-  // which cmd -> where cmd
   cmd = cmd.replace(/^which\s+/i, "where ");
-
+  cmd = cmd.replace(/^ls\s+-la(?:\s+(.+))?$/i, (_m, target) => `dir /a${target ? ` ${target}` : ""}`);
+  cmd = cmd.replace(/^cat\s+(.+)$/i, "type $1");
   return cmd;
 }
 
-export function runCommandTool(input: { command: string; path?: string }, signal?: AbortSignal): Promise<string> {
-  assertSafeCommand(input.command);
-  const normalizedCommand = normalizeWindowsCommand(input.command);
+export function normalizeCommandForHost(
+  command: string,
+  info: EnvironmentPlatformInfo = getEnvironmentPlatformInfo()
+): string {
+  return command
+    .split(/\s*&&\s*/)
+    .map((segment) => normalizeCommandSegmentForHost(segment, info))
+    .join(" && ");
+}
+
+export function normalizeWindowsCommand(command: string): string {
+  return normalizeCommandForHost(command);
+}
+
+export function resolveCommandTimeoutMs(requested?: unknown): number {
+  const configured = vscode.workspace.getConfiguration("hooshyar").get<number>("commandTimeoutMs", 120_000);
+  const candidate = typeof requested === "number" ? requested : Number(requested);
+  const timeout = Number.isFinite(candidate) && candidate > 0 ? candidate : configured;
+  return Math.min(600_000, Math.max(1_000, Math.round(timeout)));
+}
+
+function formatCommandOutput(exitCode: string | number, stdout: unknown, stderr: unknown): string {
+  const outStr = String(stdout ?? "").trimEnd();
+  const errStr = String(stderr ?? "").trimEnd();
+  return [
+    `Exit code: ${exitCode}`,
+    `STDOUT:\n${outStr || "(no output)"}`,
+    `STDERR:\n${errStr || "(no output)"}`
+  ].join("\n");
+}
+
+export function runCommandTool(input: { command: string; path?: string; timeout_ms?: number }, signal?: AbortSignal): Promise<string> {
+  const normalizedCommand = normalizeCommandForHost(input.command);
+  assertSafeCommand(normalizedCommand);
   const targetFolder = getTargetWorkspaceFolder(input.path);
   let root = targetFolder.uri.fsPath;
   if (input.path) {
@@ -708,44 +771,48 @@ export function runCommandTool(input: { command: string; path?: string }, signal
   logInfo(`run_command: ${normalizedCommand} in ${root}`);
 
   if (signal?.aborted) {
-    return Promise.resolve("Command cancelled by user.");
+    return Promise.reject(new Error("Command cancelled by user."));
   }
 
   const envInfo = getEnvironmentPlatformInfo();
+  const timeoutMs = resolveCommandTimeoutMs(input.timeout_ms);
   const execOptions: any = {
     cwd: root,
-    timeout: 30_000,
-    maxBuffer: 1024 * 1024
+    timeout: timeoutMs,
+    maxBuffer: 1024 * 1024,
+    detached: !envInfo.isWindows
   };
   if (envInfo.isWindows && envInfo.shellPath) {
     execOptions.shell = envInfo.shellPath;
   }
 
-  return new Promise((resolve) => {
-    let resolved = false;
-    const finish = (result: string) => {
-      if (!resolved) {
-        resolved = true;
-        resolve(result);
-      }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let onAbort: (() => void) | undefined;
+    const finish = (error?: Error, result?: string) => {
+      if (settled) return;
+      settled = true;
+      if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+      if (error) reject(error);
+      else resolve(result || "Exit code: 0\nSTDOUT:\n(no output)\nSTDERR:\n(no output)");
     };
 
     const child = exec(normalizedCommand, execOptions, (err, stdout, stderr) => {
       if (signal?.aborted) {
-        finish("Command cancelled by user.");
+        finish(new Error("Command cancelled by user."));
         return;
       }
-      const outStr = String(stdout ?? "");
-      const errStr = String(stderr ?? "");
       if (err) {
-        finish(`Exit code ${err.code}\nSTDOUT:\n${outStr}\nSTDERR:\n${errStr}`);
+        const timedOut = Boolean((err as any).killed) && (err as any).signal === "SIGTERM";
+        const prefix = timedOut ? `Command timed out after ${timeoutMs}ms.` : "Command failed.";
+        finish(new Error(`${prefix}\n${formatCommandOutput((err as any).code ?? "unknown", stdout, stderr)}`));
       } else {
-        finish(outStr || "(no output)");
+        finish(undefined, formatCommandOutput(0, stdout, stderr));
       }
     });
 
     if (signal) {
-      const onAbort = () => {
+      onAbort = () => {
         if (child.pid) {
           if (process.platform === "win32") {
             exec(`taskkill /pid ${child.pid} /T /F`, () => {});
@@ -759,7 +826,7 @@ export function runCommandTool(input: { command: string; path?: string }, signal
             }
           }
         }
-        finish("Command cancelled by user.");
+        finish(new Error("Command cancelled by user."));
       };
 
       signal.addEventListener("abort", onAbort, { once: true });
@@ -770,8 +837,8 @@ export function runCommandTool(input: { command: string; path?: string }, signal
 export function runInTerminalTool(input: { command: string; path?: string }): Promise<string> {
   const cmd = String(input?.command || "").trim();
   if (!cmd) throw new Error("Command is required for run_in_terminal.");
-  assertSafeCommand(cmd);
-  const normalizedCmd = normalizeWindowsCommand(cmd);
+  const normalizedCmd = normalizeCommandForHost(cmd);
+  assertSafeCommand(normalizedCmd);
 
   let targetCwd: string | undefined;
   if (input.path) {
@@ -882,6 +949,11 @@ export function normalizeToolInput(
     }
   } else if ((name === "list_files" || name === "list_codebase") && !norm.path) {
     norm.path = ".";
+  }
+
+  if (name === "run_command") {
+    const rawTimeout = rawObj.timeout_ms ?? rawObj.timeoutMs ?? rawObj.timeout;
+    if (rawTimeout !== undefined) norm.timeout_ms = Number(rawTimeout);
   }
 
   // 2. search_replace normalization
@@ -1183,6 +1255,8 @@ export async function executeTool(
       return fetchWebpageTool(input as any, ctx.signal);
     case "manage_memory":
       return manageMemoryTool(input as any);
+    case "task_complete":
+      return "Task completion acknowledged.";
     default: {
       if (name.startsWith("mcp_") || (ctx.mcpManager && ctx.mcpManager.isMcpTool(name))) {
         if (!ctx.mcpManager || !ctx.mcpServers) {
@@ -1215,6 +1289,17 @@ export function isMutatingTool(name: string): boolean {
   if (name === "write_file" || name === "search_replace" || name === "run_command" || name === "run_in_terminal") return true;
   if (name.startsWith("mcp_")) return isMcpMutatingTool(name);
   return false;
+}
+
+export function isParallelSafeTool(name: string): boolean {
+  return (
+    name === "read_file" ||
+    name === "list_files" ||
+    name === "search_codebase" ||
+    name === "get_workspace_symbols" ||
+    name === "get_diagnostics" ||
+    name === "fetch_webpage"
+  );
 }
 
 export function listWorkspaceRootsSummary(): string {

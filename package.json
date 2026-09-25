@@ -2,7 +2,7 @@
   "name": "houshiar",
   "displayName": "houshiar",
   "description": "AI coding assistant powered by your own Anthropic-compatible /v1/messages provider (Houshiar v1).",
-  "version": "0.6.1",
+  "version": "0.7.3",
   "publisher": "WebDops",
   "license": "MIT",
   "repository": {
@@ -291,13 +291,31 @@
           "maximum": 100,
           "description": "Maximum number of autonomous tool execution turns the agent can execute in one request (Plan Mode)."
         },
+        "hooshyar.commandTimeoutMs": {
+          "type": "number",
+          "default": 120000,
+          "minimum": 1000,
+          "maximum": 600000,
+          "description": "Default timeout in milliseconds for foreground run_command executions."
+        },
         "hooshyar.mcpServers": {
           "type": [
             "string",
             "object"
           ],
           "default": "{}",
-          "description": "MCP servers as a JSON object or JSON string. Stdio servers require command and optional args, env, cwd, disabled. Remote HTTP JSON-RPC servers may use url and optional headers. Example: {\"filesystem\":{\"command\":\"npx\",\"args\":[\"-y\",\"@modelcontextprotocol/server-filesystem\",\"${workspaceFolder}\"]}}. Note: SSE/event-stream MCP transports are not supported."
+          "description": "MCP servers as a JSON object or JSON string. Stdio servers require command and optional args, env, cwd, disabled; remote servers use url and optional headers."
+        },
+        "hooshyar.skills": {
+          "type": "array",
+          "items": {
+            "type": [
+              "string",
+              "object"
+            ]
+          },
+          "default": [],
+          "description": "Standalone workspace-relative Markdown/SKILL.md files that provide reusable domain expertise independently from MCP tools."
         },
         "hooshyar.enableShellTool": {
           "type": "boolean",
@@ -392,6 +410,11 @@
           "type": "boolean",
           "default": true,
           "description": "Compact large tool outputs from older turns in history to save up to 80% tokens on multi-turn chats."
+        },
+        "hooshyar.experimentalAutoCompact": {
+          "type": "boolean",
+          "default": false,
+          "description": "Experimental: automatically summarize older conversation turns near the context limit while preserving recent messages and tool calls."
         },
         "hooshyar.enablePromptCaching": {
           "type": "boolean",
