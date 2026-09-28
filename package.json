@@ -1,8 +1,9 @@
 {
   "name": "houshiar",
   "displayName": "houshiar",
+  "icon": "logo.png",
   "description": "AI coding assistant powered by your own Anthropic-compatible /v1/messages provider (Houshiar v1).",
-  "version": "0.8.4",
+  "version": "0.9.7",
   "publisher": "WebDops",
   "license": "MIT",
   "repository": {
@@ -342,6 +343,16 @@
           "default": "{}",
           "description": "MCP servers as a JSON object or JSON string. Stdio servers require command and optional args, env, cwd, disabled; remote servers use url and optional headers."
         },
+        "hooshyar.figmaProxyEnabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Route remote Figma OAuth and MCP requests through the configured proxy."
+        },
+        "hooshyar.figmaProxyUrl": {
+          "type": "string",
+          "default": "",
+          "description": "HTTP/HTTPS proxy URL used only for remote Figma requests."
+        },
         "hooshyar.skills": {
           "type": "array",
           "items": {
@@ -459,12 +470,12 @@
         },
         "hooshyar.maxFileSizeBytes": {
           "type": "number",
-          "default": 524288,
+          "default": 10485760,
           "description": "Maximum file size (bytes) read_file / search_codebase will load."
         },
         "hooshyar.maxWriteSizeBytes": {
           "type": "number",
-          "default": 1048576,
+          "default": 10485760,
           "description": "Maximum file size (bytes) write_file will accept."
         },
         "hooshyar.respectIgnoreFiles": {
@@ -606,7 +617,7 @@
     "watch": "tsc -watch -p ./",
     "test": "npm run compile && node --require ./test/mockVscode.cjs --test test/*.test.mjs",
     "lint": "eslint src --ext .ts",
-    "package": "vsce package --no-yarn --no-dependencies --allow-missing-repository"
+    "package": "vsce package --no-yarn --allow-missing-repository"
   },
   "devDependencies": {
     "@types/node": "^20.19.43",
@@ -616,5 +627,8 @@
     "@vscode/vsce": "^2.24.0",
     "eslint": "^8.57.0",
     "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "undici": "^6.29.0"
   }
 }

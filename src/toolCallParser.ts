@@ -416,9 +416,13 @@ export function normalizeRelPath(p: string): string {
 
 export function truncateToolOutput(output: string, max = 45_000): string {
   if (output.length <= max) return output;
+  const headChars = Math.floor(max * 0.7);
+  const tailChars = Math.floor(max * 0.3);
+  const omitted = output.length - headChars - tailChars;
   return (
-    output.slice(0, max) +
-    `\n... (truncated — ${output.length - max} more characters. For files, use read_file with start_line and end_line to inspect remaining sections.)`
+    output.slice(0, headChars) +
+    `\n\n... [${omitted} characters omitted. For files, use read_file with start_line/end_line or get_symbol] ...\n\n` +
+    output.slice(-tailChars)
   );
 }
 

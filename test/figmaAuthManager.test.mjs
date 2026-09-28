@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import crypto from "node:crypto";
 import {
   FigmaAuthManager,
+  FIGMA_SESSION_LIFETIME_MS,
   generatePKCE,
   buildFigmaAuthorizationUrl,
   FIGMA_REMOTE_MCP_URL,
@@ -82,6 +83,7 @@ describe("Figma Auth Manager & MCP Integration Tests", () => {
     const status = await authManager.getAuthStatus();
     assert.equal(status.authenticated, true);
     assert.equal(status.scope, "mcp:connect");
+    assert.ok(status.expiresAt >= Date.now() + FIGMA_SESSION_LIFETIME_MS - 1000);
 
     // Get valid access token
     const token = await authManager.getValidAccessToken();
@@ -145,12 +147,14 @@ describe("Figma Auth Manager & MCP Integration Tests", () => {
     const manager = new McpManager();
     let callCount = 0;
     let refreshCalled = false;
+    let activeToken = "expired_token";
 
     manager.setFigmaTokenProvider(
-      async () => "expired_token",
+      async () => activeToken,
       async () => {
         refreshCalled = true;
-        return "new_refreshed_token";
+        activeToken = "new_refreshed_token";
+        return activeToken;
       }
     );
 
@@ -168,12 +172,24 @@ describe("Figma Auth Manager & MCP Integration Tests", () => {
           };
         }
         if (auth === "Bearer new_refreshed_token") {
+          const payload = JSON.parse(options.body);
+          if (payload.method === "notifications/initialized") {
+            return {
+              ok: true,
+              status: 202,
+              headers: new Headers()
+            };
+          }
           return {
             ok: true,
             status: 200,
-            headers: new Headers({ "content-type": "application/json" }),
+            headers: new Headers({
+              "content-type": "application/json",
+              ...(payload.method === "initialize" ? { "mcp-session-id": "figma-session-1" } : {})
+            }),
             json: async () => ({
               result: {
+                ...(payload.method === "initialize" ? { protocolVersion: "2025-03-26", capabilities: {} } : {}),
                 tools: [
                   {
                     name: "get_figma_data",
@@ -193,7 +209,7 @@ describe("Figma Auth Manager & MCP Integration Tests", () => {
       });
 
       assert.equal(refreshCalled, true);
-      assert.equal(callCount, 2);
+      assert.equal(callCount, 4);
       assert.equal(tools.length, 1);
       assert.equal(tools[0].name, "mcp_figma_get_figma_data");
     } finally {

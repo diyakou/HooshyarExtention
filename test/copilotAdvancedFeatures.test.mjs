@@ -5,6 +5,7 @@ import {
   getWorkspaceSymbolsTool,
   getDiagnosticsTool,
   cleanHtmlToMarkdown,
+  fetchWebpageTool,
   manageMemoryTool,
   buildToolDefinitions,
   assertSafeCommand,
@@ -138,6 +139,13 @@ test("Advanced Copilot Parity Features Tests", async (t) => {
     assert.ok(names.includes("get_diagnostics"));
     assert.ok(names.includes("fetch_webpage"));
     assert.ok(names.includes("manage_memory"));
+  });
+
+  await t.test("fetchWebpageTool routes private Figma links to MCP", async () => {
+    await assert.rejects(
+      () => fetchWebpageTool({ url: "https://www.figma.com/design/file-key/Test?node-id=0-1" }),
+      /mcp_figma_/i
+    );
   });
 
   await t.test("rulesLoader collects copilot-instructions.md, AGENTS.md and CLAUDE.md", async () => {

@@ -1,4 +1,5 @@
-import * as vscode from "vscode";
+﻿import * as vscode from "vscode";
+import { setTimeout } from "node:timers";
 import { ChatViewProvider } from "./chatViewProvider";
 import { HooshyarInlineCompletionProvider } from "./inlineCompletionProvider";
 import { EnhancedCodeLensProvider } from "./codeLensProvider";
@@ -10,7 +11,7 @@ import {
   HooshyarOriginalContentProvider,
   openDiffForFile
 } from "./diffPreview";
-import { getLogger, logInfo } from "./logger";
+import { logInfo, logWarn, getLogger } from "./logger";
 import { undoLastWrite, hasWriteBackup, revertFile } from "./writeBackup";
 import { generateCommitMessage } from "./gitCommitGenerator";
 import { runInlineChat } from "./inlineChatProvider";
@@ -23,6 +24,11 @@ import { ProjectProfileManager } from "./projectProfile/profileManager";
 import { registerTaskProvider } from "./taskIntegration/taskProvider";
 import { getTerminalManager } from "./terminal/terminalManager";
 import { registerTestExplorer } from "./testing/testExplorerProvider";
+import {
+  CodebaseIntelligence,
+  getIncrementalIndexer,
+  getAgentRuntime
+} from "./intelligence";
 
 export async function activate(context: vscode.ExtensionContext) {
   // Initialize Developer Persistent Memory Manager before creating ChatViewProvider
@@ -36,6 +42,17 @@ export async function activate(context: vscode.ExtensionContext) {
   const codeIndex = getWorkspaceCodeIndex();
   await codeIndex.initialize(vscode.Uri.joinPath(context.globalStorageUri, "indexes"));
   context.subscriptions.push(codeIndex);
+
+  // Initialize Codebase Intelligence Layer & Incremental Indexer (lazy, non-blocking)
+  const incrementalIndexer = getIncrementalIndexer();
+  setTimeout(() => {
+    incrementalIndexer.initialize().catch((err) => {
+      logWarn(`Incremental indexer background init: ${err?.message ?? err}`);
+    });
+  }, 500);
+  context.subscriptions.push(incrementalIndexer);
+  context.subscriptions.push(CodebaseIntelligence.getCodebaseIntelligence());
+  context.subscriptions.push(getAgentRuntime());
 
   const projectProfile = new ProjectProfileManager(context.globalState);
   // Analyze project profile on startup (background)

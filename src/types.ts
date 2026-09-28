@@ -1,4 +1,4 @@
-// Minimal typings for the /v1/messages Anthropic-compatible API described
+﻿// Minimal typings for the /v1/messages Anthropic-compatible API described
 // in your OpenAPI spec. Only what this extension actually uses.
 
 export type Role = "user" | "assistant";
@@ -151,6 +151,8 @@ export interface SettingsData {
   enableShellTool: boolean;
   /** JSON object of stdio MCP servers; values contain command, args, env, and optional disabled. */
   mcpServers: string;
+  figmaProxyEnabled: boolean;
+  figmaProxyUrl: string;
   skills: SkillReference[];
   requireApprovalForWrites: boolean;
   autoApproveCommands?: boolean;
@@ -185,6 +187,7 @@ export type ExtensionToWebviewMessage =
   | { type: "activeTurnSync"; text: string; isWorking: boolean }
   | { type: "fileReverted"; path: string; message: string }
   | { type: "testConnectionResult"; ok: boolean; message: string }
+  | { type: "apiUsageResult"; ok: boolean; usage?: import("./apiConfig").ApiUsageResponse; message?: string }
   | { type: "liveToolStart"; id: string; name: string }
   | { type: "liveToolStop"; id: string; name: string; input: Record<string, unknown> }
   | { type: "modeChanged"; mode: ChatMode }
@@ -202,6 +205,9 @@ export type WebviewToExtensionMessage =
   | { type: "newChat" }
   | { type: "stop" }
   | { type: "attachFile" }
+  | { type: "attachFolder" }
+  | { type: "addImageData"; dataUrl: string; name?: string }
+  | { type: "addFileContent"; name: string; content: string }
   | { type: "removeAttachment"; kind: "file" | "image"; index: number }
   | { type: "approvalResponse"; id: string; approved: boolean; alwaysApprove?: boolean }
   | { type: "openHistory" }
@@ -226,6 +232,7 @@ export type WebviewToExtensionMessage =
   | { type: "getSettings" }
   | { type: "saveSettings"; settings: Partial<SettingsData> }
   | { type: "testConnection"; tempSettings?: Partial<SettingsData> }
+  | { type: "requestApiUsage"; tempSettings?: Pick<SettingsData, "baseUrl" | "apiKey" | "apiFormat"> }
   | { type: "testMcpServers"; rawMcpServers?: string }
   | { type: "addSkills"; existingSkills: SkillReference[] }
   | { type: "openSettingsModal" }

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { parseRetryAfterDelayMs } from "../out/apiClient.js";
-import { normalizeModelsUrl } from "../out/apiConfig.js";
+import { normalizeModelsUrl, normalizeUsageUrl } from "../out/apiConfig.js";
 import { buildRequestHeaders, readInlineApiConfig } from "../out/apiConfig.js";
 
 test("API Client Resilience Tests", async (t) => {
@@ -9,6 +9,12 @@ test("API Client Resilience Tests", async (t) => {
     assert.equal(normalizeModelsUrl("https://api.example.com/v1"), "https://api.example.com/v1/models");
     assert.equal(normalizeModelsUrl("https://api.example.com/v1/messages"), "https://api.example.com/v1/models");
     assert.equal(normalizeModelsUrl("https://api.example.com/v1/chat/completions"), "https://api.example.com/v1/models");
+  });
+  await t.test("normalizeUsageUrl targets v1/usage from supported base URL forms", () => {
+    assert.equal(normalizeUsageUrl("https://api.example.com/v1"), "https://api.example.com/v1/usage");
+    assert.equal(normalizeUsageUrl("https://api.example.com/v1/messages"), "https://api.example.com/v1/usage");
+    assert.equal(normalizeUsageUrl("https://api.example.com/v1/chat/completions"), "https://api.example.com/v1/usage");
+    assert.equal(normalizeUsageUrl("https://api.example.com/v1/token/usage"), "https://api.example.com/v1/token/usage");
   });
   await t.test("parseRetryAfterDelayMs parses integer seconds correctly", () => {
     const delay = parseRetryAfterDelayMs("5", 1000);

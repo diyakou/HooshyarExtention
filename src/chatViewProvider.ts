@@ -1,7 +1,8 @@
 import * as vscode from "vscode";
 import * as path from "path";
+import * as fs from "fs/promises";
 import { ApiClient } from "./apiClient";
-import { fetchAvailableModels, readApiClientConfig, ToolProtocol } from "./apiConfig";
+import { fetchApiUsage, fetchAvailableModels, readApiClientConfig, ToolProtocol } from "./apiConfig";
 import { buildUserContent, imageToDataUrl, isImagePath, isLikelyTextFile, readImageAttachment } from "./attachments";
 import {
   trimHistoryForContext,
@@ -42,9 +43,10 @@ import { ApprovalEngine } from "./approvalEngine";
 import { AgentState, AgentStateMachine } from "./agent/agentState";
 import { detectModelCapabilities } from "./modelCapabilities";
 import { ContextEngine } from "./context/contextEngine";
+import { getAgentRuntime } from "./intelligence";
 import { McpManager, McpServerConfig, readMcpServers, parseMcpServersWithValidation, loadWorkspaceMcpConfig } from "./mcpManager";
-import { FigmaAuthManager, FIGMA_REMOTE_MCP_URL, FIGMA_DESKTOP_MCP_URL } from "./figmaAuthManager";
-import { resolveWorkspaceUri, readTextFile, isSubpath, normalizeFsPath } from "./workspaceUtils";
+import { FigmaAuthManager, FigmaAuthStatus, FIGMA_REMOTE_MCP_URL, FIGMA_DESKTOP_MCP_URL } from "./figmaAuthManager";
+import { resolveWorkspaceUri, readTextFile, isSubpath, normalizeFsPath, isBinaryBuffer } from "./workspaceUtils";
 import { ReviewManager } from "./reviewManager";
 import { MemoryManager } from "./memoryManager";
 import { getGitDiff, generateCommitMessage } from "./gitCommitGenerator";
@@ -76,6 +78,11 @@ const AGENT_SYSTEM_PROMPT_BASE =
   "You operate in AGENT MODE: you plan multi-step work yourself, use tools to explore and modify the " +
   "user's actual codebase, and keep going across multiple tool calls until the task is fully done, " +
   "instead of just describing what the user should do.\n\n" +
+  "## SUB-AGENTS FOR LARGE PROJECTS\n" +
+  "For a large, unfamiliar, or cross-cutting task, call delegate_to_subagents once near the start with 2-4 focused specialist roles. " +
+  "Use architecture + implementation for broad changes, add tests for behavioral work, and add security only when trust boundaries are relevant. " +
+  "Sub-agents are read-only scouts: synthesize their evidence, resolve overlaps, then perform edits and verification yourself. " +
+  "Do not delegate small tasks or repeatedly delegate the same goal.\n\n" +
   "## WORKSPACE & PROJECT ACCESS (READ THIS FIRST)\n" +
   "You DO have full, direct access to the user's currently open VS Code workspace and all open project folders through your tools. " +
   "The workspace root path, all opened project folders, and project structures are available to you. " +
@@ -111,19 +118,25 @@ const AGENT_SYSTEM_PROMPT_BASE =
   "   - When in text mode, format write_file as:\n" +
   "     <write_file>\n<path>relative/path/to/file.ext</path>\n<content>\n...FULL file content...\n</content>\n</write_file>\n" +
   "3. Never dump code in chat without calling tools. If asked to make a change, use `search_replace` (or `write_file` for new files) so the change actually applies to disk.\n\n" +
-  "## AVAILABLE TOOLS\n" +
-  "- read_file {path}: read a workspace file.\n" +
+  "## AVAILABLE TOOLS (PREFER SYMBOL-FIRST RETRIEVAL OVER FULL-FILE READS)\n" +
+  "- get_symbol {symbol, path?, line?}: PRIMARY RETRIEVAL TOOL. Fetch exact code range, callers, direct dependencies, and tests for a specific function/method/class. Prefer this over read_file!\n" +
+  "- get_file_outline {path}: Inspect all functions, classes, imports, and exports of a file without reading the whole file body. Use before reading large files!\n" +
+  "- find_symbol {query}: Search workspace symbols (functions, classes, interfaces) across AST via Language Server.\n" +
+  "- find_callers {symbol?, path?, line?, character?}: Discover all incoming callers/call hierarchy for a symbol before editing public code.\n" +
+  "- find_dependencies {symbol?, path?, line?, character?}: Discover definitions and outgoing dependencies for a symbol.\n" +
+  "- get_related_tests {path}: Find test suites and unit tests associated with a source file.\n" +
+  "- get_project_map {maxDepth?}: Get compact project directory tree with symbol counts to understand structure.\n" +
+  "- read_file {path, start_line?, end_line?}: read workspace file content. Use only when full-file context is truly needed, or with start_line/end_line.\n" +
   "- search_replace {path, old_string, new_string, replace_all?}: TARGETED EDIT for existing files (primary tool for edits/fixes).\n" +
   "- write_file {path, content}: create a NEW file (only for new files or explicit full rewrites).\n" +
   "- list_files {path}: list a directory (non-recursive). If in a multi-project workspace, path '.' lists all open project folders.\n" +
   "- list_codebase {path?, glob?, depth?}: recursively list project files across open project folders.\n" +
-  "- search_codebase {pattern, path?, glob?, is_regex?, depth?}: grep-like search across open project folders.\n" +
+  "- search_codebase {pattern, path?, glob?, is_regex?, depth?}: grep-like text search across project folders (use for INITIAL discovery only).\n" +
   "- semantic_search {query, maxResults?, paths?, language?}: hybrid indexed retrieval across code meaning, text, symbols, recency, and active context.\n" +
   "- update_tasks {tasks: [{id, content, status}]}: show/update your plan checklist.\n" +
   "- run_command {command, path?}: run a shell command, test suite (e.g. 'npm test', 'npm run compile', 'pytest'), or script in the workspace root or specified directory and inspect stdout/stderr. Must be compatible with host OS.\n" +
   "- run_in_terminal {command, path?}: send an interactive command or dev server directly to the visible VS Code integrated terminal.\n" +
   "- get_workspace_symbols {query}: search for functions, classes, interfaces, methods, and variables across the entire workspace AST.\n" +
-  "- find_symbol {query}: resolve named code symbols. For definitions, usages, implementations, hover, document symbols, and call hierarchy, prefer the corresponding Language Service tools over grep.\n" +
   "- find_definition/find_references/find_implementations/get_hover {path?, line?, character?, symbol?}: precise language-service navigation.\n" +
   "- get_document_symbols {path} and get_call_hierarchy {...}: inspect structural code relationships.\n" +
   "- rename_symbol {..., newName}: language-service workspace rename; this is a write operation requiring permission.\n" +
@@ -132,7 +145,11 @@ const AGENT_SYSTEM_PROMPT_BASE =
   "- manage_memory {action, key?, value?}: manage persistent user preferences across projects (actions: store, recall, delete, list).\n" +
   "- task_complete {}: explicitly signal that a tool-driven task is fully finished. Call it alone after your concise final summary and only when every task-list item is completed.\n" +
   "- MCP tools (prefixed with mcp_<server>_<tool>): external tools provided by connected Model Context Protocol servers.\n\n" +
-  "## GUIDELINES & WHEN TO STOP CALLING TOOLS (CRITICAL)\n" +
+  "## RETRIEVAL STRATEGY & CLOSED-LOOP EDITING (CRITICAL)\n" +
+  "- SYMBOL-FIRST RETRIEVAL: Do NOT load entire files into context! Default retrieval unit is symbol, function, method, class, or relevant range. Prefer `get_symbol` or `get_file_outline` over `read_file`.\n" +
+  "- CONTROLLED EXPLORATION: Use `search_codebase` or `get_project_map` for initial discovery. Once primary symbols/files are found, switch to `get_symbol`, `find_references`, and `find_callers`. Do NOT repeat broad searches for items already discovered!\n" +
+  "- IMPACT ANALYSIS: Before editing exported functions, public methods, or interfaces, check callers with `find_callers` or `find_references` to avoid breaking downstream code.\n" +
+  "- CLOSED-LOOP EDITING: After modifying code, check `get_diagnostics`. If errors were introduced, fix them immediately. Run relevant tests with `run_command` before concluding.\n" +
   "- OPERATING SYSTEM COMPATIBILITY: Look at the Operating System and Shell in [environment_details]. When generating shell commands, strictly follow host OS syntax. On Windows, NEVER output Linux-only commands (e.g. ls, cat, grep, export, rm -rf, source); use Windows/PowerShell commands or cross-platform scripts like npm, python, node.\n" +
   "- MULTI-PROJECT WORKSPACE: If multiple project folders are open, target files by prefixing with the project folder name (e.g. `FolderName/src/file.ts`).\n" +
   "- TESTING & CODE EXECUTION: Use `run_command` for foreground tests/builds whose exit code and output you must inspect. Use `run_in_terminal` only for interactive or long-running commands such as dev servers. If a command fails, inspect its real stderr, fix the cause, and re-run it.\n" +
@@ -140,12 +157,13 @@ const AGENT_SYSTEM_PROMPT_BASE =
   "- For multi-step implementation tasks, start by calling update_tasks with a clear plan (3-5 steps).\n" +
   "- CONTINUOUS PLAN EXECUTION: When executing a multi-step plan, DO NOT stop after editing the first file! Keep executing until ALL tasks in your task list are completed. Update task status with update_tasks as you finish each step (mark done items 'completed' and active item 'in_progress'). Only give your final conversational summary after all tasks are finished.\n" +
   "- FOR SINGLE-STEP TASKS: As soon as your single search_replace or write_file succeeds, conclude immediately and summarize.\n" +
-  "- LIMIT EXPLORATION: Read only the relevant files before making the change. 1 to 2 tool calls are usually enough.\n" +
-  "- WHEN ASKED TO EDIT/FIX CODE: Read the target file -> use `search_replace` to update only the modified function/lines -> do NOT overwrite the whole file.\n" +
+  "- LIMIT EXPLORATION: Read only the relevant symbols/ranges before making the change. 1 to 2 targeted calls are usually enough.\n" +
+  "- WHEN ASKED TO EDIT/FIX CODE: Read the target symbol/range -> use `search_replace` to update only the modified function/lines -> do NOT overwrite the whole file.\n" +
   "- NEVER REPEAT CALLS: Do not call the same tool with the exact same arguments repeatedly.\n" +
-  "- INFORMATIONAL REQUESTS: When asked to explain, analyze, or answer questions about files, read the file once, and then answer directly in chat without further tool calls.\n" +
+  "- INFORMATIONAL REQUESTS: When asked to explain, analyze, or answer questions about files, inspect the symbol or outline once, and then answer directly in chat without further tool calls.\n" +
   "- MCP TOOLS & EXTERNAL ASSETS (e.g. Figma, APIs, databases):\n" +
-  "  * When given an external link or ID (e.g. a Figma URL like figma.com/design/<fileKey>/...): invoke the corresponding MCP tool (such as mcp_figma_get_figma_data) with the extracted fileKey and nodeId.\n" +
+  "  * FIGMA ROUTING RULE: A figma.com/design, /file, /board, or /make URL is private application data, not a webpage. NEVER call fetch_webpage for it. You MUST use an available mcp_figma_* tool such as get_design_context, get_metadata, or get_screenshot with the fileKey and nodeId extracted from the URL.\n" +
+  "  * For a URL like figma.com/design/<fileKey>/...?node-id=12-34, fileKey is the path segment after /design/ and nodeId is 12:34 (convert the URL dash separator to a colon when the MCP schema expects it).\n" +
   "  * CRITICAL ACCURACY RULE: If an external tool call fails or returns an error (e.g. 404 Not Found, permission denied, or authentication error), ALWAYS clearly report the error to the user and explain that the external file could not be accessed. NEVER pretend or hallucinate what was in the external file, and NEVER substitute existing local workspace files (such as an existing index.html or older plan) as if they were the content of the failed external link!\n" +
   "- For a tool-driven task, when all work and verification are complete, write a concise summary in Persian or the user's language, then call `task_complete` by itself. Informational answers that need no tools may end normally without it.";
 
@@ -179,6 +197,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private readonly approvalEngine = new ApprovalEngine();
   private readonly agentState = new AgentStateMachine();
   private readonly contextEngine = new ContextEngine();
+  private readonly agentRuntime = getAgentRuntime();
   private mcpManager = new McpManager();
   private isCompactingContext = false;
   private figmaAuthManager: FigmaAuthManager;
@@ -188,7 +207,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const settingVal = cfg.get<unknown>("mcpServers", "{}");
     const fromSettings = readMcpServers(settingVal);
     const fromWorkspace = await loadWorkspaceMcpConfig();
-    return { ...fromSettings, ...fromWorkspace };
+    const all: Record<string, McpServerConfig> = { ...fromSettings, ...fromWorkspace };
+    if (!all.figma) {
+      try {
+        const figmaStatus = await this.figmaAuthManager.getAuthStatus();
+        if (figmaStatus.authenticated) {
+          all.figma = { url: FIGMA_REMOTE_MCP_URL };
+        }
+      } catch {
+        // ignore
+      }
+    }
+    return all;
   }
 
   public getMcpManager(): McpManager {
@@ -239,7 +269,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly secretStorage: vscode.SecretStorage,
     private readonly memento: vscode.Memento
   ) {
-    this.figmaAuthManager = new FigmaAuthManager(secretStorage);
+    const readFigmaProxy = () => {
+      const cfg = vscode.workspace.getConfiguration("hooshyar");
+      return {
+        enabled: cfg.get<boolean>("figmaProxyEnabled", false),
+        url: cfg.get<string>("figmaProxyUrl", "")
+      };
+    };
+    this.figmaAuthManager = new FigmaAuthManager(secretStorage, readFigmaProxy);
+    this.mcpManager.setFigmaProxyProvider(readFigmaProxy);
     this.mcpManager.setFigmaTokenProvider(
       () => this.figmaAuthManager.getValidAccessToken(),
       () => this.figmaAuthManager.refreshTokens().then((t) => t?.accessToken ?? null)
@@ -416,6 +454,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           }
           break;
         }
+        case "requestApiUsage": {
+          const current = this.readConfig();
+          const usageConfig = {
+            ...current,
+            baseUrl: msg.tempSettings?.baseUrl?.trim() || current.baseUrl,
+            apiKey: msg.tempSettings?.apiKey !== undefined ? msg.tempSettings.apiKey.trim() : current.apiKey,
+            apiFormat: msg.tempSettings?.apiFormat || current.apiFormat
+          };
+          if (!usageConfig.apiKey) {
+            this.postToWebview({ type: "apiUsageResult", ok: false, message: "ابتدا API Key را وارد کنید." });
+            break;
+          }
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 15_000);
+          try {
+            const usage = await fetchApiUsage(usageConfig, controller.signal);
+            this.postToWebview({ type: "apiUsageResult", ok: true, usage });
+          } catch (error: any) {
+            const message = error?.name === "AbortError" ? "دریافت وضعیت مصرف بیش از حد طول کشید." : (error?.message ?? String(error));
+            this.postToWebview({ type: "apiUsageResult", ok: false, message });
+          } finally { clearTimeout(timeout); }
+          break;
+        }
         case "newChat":
           this.newChat();
           break;
@@ -424,6 +485,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case "attachFile":
           await this.pickAndAttachFile("all");
+          break;
+        case "attachFolder":
+          await this.pickAndAttachFolder();
+          break;
+        case "addImageData":
+          await this.addImageDataUrl(msg.dataUrl, msg.name);
+          break;
+        case "addFileContent":
+          this.addDroppedFileContent(msg.name, msg.content);
           break;
         case "attachTxtMdFile":
           await this.pickAndAttachFile("txt_md");
@@ -564,6 +634,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               await cfg.update("skills", s.skills, vscode.ConfigurationTarget.Global);
             }
             if (s.debugLogging !== undefined) await cfg.update("debugLogging", s.debugLogging, vscode.ConfigurationTarget.Global);
+            if (s.figmaProxyEnabled !== undefined) await cfg.update("figmaProxyEnabled", s.figmaProxyEnabled, vscode.ConfigurationTarget.Global);
+            if (s.figmaProxyUrl !== undefined) {
+              const proxyUrl = s.figmaProxyUrl.trim();
+              if (s.figmaProxyEnabled && !/^https?:\/\//i.test(proxyUrl)) {
+                throw new Error("آدرس پروکسی Figma باید با http:// یا https:// شروع شود.");
+              }
+              await cfg.update("figmaProxyUrl", proxyUrl, vscode.ConfigurationTarget.Global);
+            }
             if (s.mcpServers !== undefined) {
               const trimmed = typeof s.mcpServers === "string" ? s.mcpServers.trim() : "";
               if (trimmed && trimmed !== "{}") {
@@ -668,7 +746,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this.postToWebview({
             type: "figmaAuthStatus",
             authenticated: result.success,
-            expiresAt: result.tokens?.expiresAt
+            expiresAt: result.tokens?.sessionExpiresAt ?? result.tokens?.expiresAt
           });
           break;
         }
@@ -785,10 +863,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.openSettingsModal();
   }
 
-  public openSettingsModal(): void {
+  public async openSettingsModal(): Promise<void> {
     const cfg = vscode.workspace.getConfiguration("hooshyar");
     const rawMcp = cfg.get<unknown>("mcpServers", "{}");
-    const mcpServersStr = typeof rawMcp === "string" ? rawMcp : JSON.stringify(rawMcp, null, 2);
+    let mcpServersStr = typeof rawMcp === "string" ? rawMcp : JSON.stringify(rawMcp, null, 2);
+
+    let figmaStatus: FigmaAuthStatus = { authenticated: false };
+    try {
+      figmaStatus = await this.figmaAuthManager.getAuthStatus();
+      if (figmaStatus.authenticated) {
+        const { servers } = parseMcpServersWithValidation(mcpServersStr);
+        if (!servers.figma) {
+          servers.figma = { url: FIGMA_REMOTE_MCP_URL };
+          mcpServersStr = JSON.stringify(servers, null, 2);
+        }
+      }
+    } catch {
+      // ignore
+    }
+
     const settings: SettingsData = {
       apiFormat: cfg.get<"anthropic" | "openai">("apiFormat", "anthropic"),
       baseUrl: cfg.get<string>("baseUrl", "https://wqai.morvism.ir/v1"),
@@ -807,17 +900,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       experimentalAutoCompact: cfg.get<boolean>("experimentalAutoCompact", false),
       skills: cfg.get<SkillReference[]>("skills", []),
       debugLogging: cfg.get<boolean>("debugLogging", false),
+      figmaProxyEnabled: cfg.get<boolean>("figmaProxyEnabled", false),
+      figmaProxyUrl: cfg.get<string>("figmaProxyUrl", ""),
       mcpServers: mcpServersStr
     };
     this.postToWebview({ type: "settingsLoaded", settings });
-    this.figmaAuthManager.getAuthStatus().then((status) => {
-      this.postToWebview({
-        type: "figmaAuthStatus",
-        authenticated: status.authenticated,
-        expiresAt: status.expiresAt,
-        error: status.error
-      });
-    }).catch(() => {});
+    this.postToWebview({
+      type: "figmaAuthStatus",
+      authenticated: figmaStatus.authenticated,
+      expiresAt: figmaStatus.expiresAt,
+      error: figmaStatus.error
+    });
     vscode.commands.executeCommand("hooshyar.chatView.focus");
   }
 
@@ -1043,15 +1136,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   public async addUriToChat(uri: vscode.Uri): Promise<void> {
     const folders = vscode.workspace.workspaceFolders;
     try {
+      const stat = vscode.workspace.fs.stat ? await vscode.workspace.fs.stat(uri) : await fs.stat(uri.fsPath);
+      const isDirectory = "type" in stat ? ((stat as vscode.FileStat).type & vscode.FileType.Directory) !== 0 : (stat as import("fs").Stats).isDirectory();
+      if (isDirectory) {
+        await this.addFolderToChat(uri);
+        return;
+      }
       if (isImagePath(uri.fsPath)) {
         const image = await readImageAttachment(uri);
-        this.pendingImages.push(image);
+        if (!this.pendingImages.some((item) => item.name === image.name && item.base64 === image.base64)) this.pendingImages.push(image);
       } else {
         if (!isLikelyTextFile(uri.fsPath)) {
           vscode.window.showWarningMessage(`Hooshyar: skipped binary file ${path.basename(uri.fsPath)}`);
           return;
         }
-        const bytes = await vscode.workspace.fs.readFile(uri);
+        const bytes = vscode.workspace.fs.readFile ? await vscode.workspace.fs.readFile(uri) : await fs.readFile(uri.fsPath);
         const content = Buffer.from(bytes).toString("utf-8");
         let relPath = path.basename(uri.fsPath);
         if (folders && folders.length > 0) {
@@ -1064,13 +1163,79 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             }
           }
         }
-        this.pendingAttachments.push({ path: relPath, content });
+        const existing = this.pendingAttachments.findIndex((item) => item.path === relPath);
+        if (existing >= 0) this.pendingAttachments[existing] = { path: relPath, content };
+        else this.pendingAttachments.push({ path: relPath, content });
       }
       this.postAttachments();
       await vscode.commands.executeCommand("hooshyar.chatView.focus");
     } catch (err: any) {
       vscode.window.showWarningMessage(`Hooshyar: couldn't attach ${uri.fsPath}: ${err?.message ?? err}`);
     }
+  }
+
+  public getPendingAttachments(): AttachedFile[] {
+    return this.pendingAttachments.map((item) => ({ ...item }));
+  }
+
+  private async addFolderToChat(folderUri: vscode.Uri): Promise<void> {
+    const maxFiles = vscode.workspace.getConfiguration("hooshyar").get<number>("maxAttachedFolderFiles", 100);
+    const queue: vscode.Uri[] = [folderUri];
+    const collected: Array<{ relativePath: string; content: string }> = [];
+    const ignored = new Set(["node_modules", ".git", "dist", "out", "build", ".next", "coverage", ".venv", "venv"]);
+    while (queue.length > 0 && collected.length < maxFiles) {
+      const current = queue.shift()!;
+      const entries: [string, vscode.FileType][] = vscode.workspace.fs.readDirectory
+        ? await vscode.workspace.fs.readDirectory(current)
+        : (await fs.readdir(current.fsPath, { withFileTypes: true })).map((entry) => [entry.name, entry.isDirectory() ? vscode.FileType.Directory : vscode.FileType.File]);
+      for (const [name, type] of entries) {
+        if (collected.length >= maxFiles) break;
+        if (ignored.has(name)) continue;
+        const child = vscode.Uri.joinPath(current, name);
+        if ((type & vscode.FileType.Directory) !== 0) queue.push(child);
+        else if ((type & vscode.FileType.File) !== 0 && isLikelyTextFile(child.fsPath) && !isImagePath(child.fsPath)) {
+          const bytes = vscode.workspace.fs.readFile ? await vscode.workspace.fs.readFile(child) : await fs.readFile(child.fsPath);
+          collected.push({ relativePath: path.relative(folderUri.fsPath, child.fsPath).split(path.sep).join("/"), content: Buffer.from(bytes).toString("utf-8") });
+        }
+      }
+    }
+    const label = `${path.basename(folderUri.fsPath)} (${collected.length} files)`;
+    const content = collected.map((file) => `--- ${file.relativePath} ---\n${file.content}`).join("\n\n");
+    const existing = this.pendingAttachments.findIndex((item) => item.path === label);
+    const attachment = { path: label, content };
+    if (existing >= 0) this.pendingAttachments[existing] = attachment; else this.pendingAttachments.push(attachment);
+    if (collected.length >= maxFiles) vscode.window.showWarningMessage(`Hooshyar: folder attachment limited to ${maxFiles} supported files.`);
+    this.postAttachments();
+  }
+
+  private async pickAndAttachFolder(): Promise<void> {
+    const uris = await vscode.window.showOpenDialog({
+      canSelectFiles: false, canSelectFolders: true, canSelectMany: true,
+      defaultUri: vscode.workspace.workspaceFolders?.[0]?.uri,
+      openLabel: "Attach folder to chat"
+    });
+    for (const uri of uris || []) await this.addFolderToChat(uri);
+  }
+
+  private async addImageDataUrl(dataUrl: string, name = "dropped-image.png"): Promise<void> {
+    const match = /^data:(image\/(?:png|jpeg|gif|webp));base64,([A-Za-z0-9+/=]+)$/i.exec(dataUrl || "");
+    if (!match) throw new Error("Unsupported dropped image. Use PNG, JPEG, GIF, or WebP.");
+    const bytes = Buffer.from(match[2], "base64");
+    const maxBytes = vscode.workspace.getConfiguration("hooshyar").get<number>("maxImageSizeBytes", 4 * 1024 * 1024);
+    if (bytes.byteLength > maxBytes) throw new Error(`Image too large. Maximum size is ${maxBytes} bytes.`);
+    const mediaType = match[1].toLowerCase() === "image/jpg" ? "image/jpeg" : match[1].toLowerCase();
+    this.pendingImages.push({ name, mediaType: mediaType as AttachedImage["mediaType"], base64: match[2] });
+    this.postAttachments();
+  }
+
+  private addDroppedFileContent(name: string, content: string): void {
+    const safeName = path.basename(name || "dropped-file.txt");
+    const maxChars = 1_000_000;
+    if (content.length > maxChars) throw new Error("Dropped text file is too large (maximum 1,000,000 characters).");
+    const existing = this.pendingAttachments.findIndex((item) => item.path === safeName);
+    const attachment = { path: safeName, content };
+    if (existing >= 0) this.pendingAttachments[existing] = attachment; else this.pendingAttachments.push(attachment);
+    this.postAttachments();
   }
 
   private async pickAndAttachFile(filterType: "txt_md" | "all" = "all") {
@@ -1410,14 +1575,41 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.pendingImages = [];
     this.postAttachments();
 
+    // 1. Intent Analysis & Symbol-First Context Discovery
+    const intent = this.agentRuntime.analyseIntent(text);
+    let symbolContextBlock = "";
+    if (this.currentMode !== "chat" && (intent.primarySymbols.length > 0 || intent.isEditIntent)) {
+      try {
+        const agentCtx = await this.agentRuntime.retrieveContext({
+          query: text,
+          primarySymbols: intent.primarySymbols,
+          taskGoal: intent.goal,
+          maxTokenBudget: 6000
+        });
+        if (agentCtx.codeContext) {
+          symbolContextBlock = `[Symbol Intelligence Context]:\n${agentCtx.codeContext}`;
+        }
+      } catch (err: any) {
+        logWarn(`Symbol-first retrieval skipped: ${err?.message ?? err}`);
+      }
+    }
+
     const contextBudget = vscode.workspace.getConfiguration("hooshyar").get<number>("contextInputBudgetTokens", 20_000);
-    const selectedContext = this.contextEngine.select(
-      [
-        { id: "environment", source: "workspace", content: envAndMentions, relevance: 1, priority: 100, essential: true },
-        { id: "attachments", source: "attachments", content: contextPrefix, relevance: 1, priority: 90 }
-      ],
-      contextBudget
-    );
+    const contextItems: Array<{ id: string; source: string; content: string; relevance: number; priority: number; essential?: boolean }> = [
+      { id: "environment", source: "workspace", content: envAndMentions, relevance: 1, priority: 100, essential: true },
+      { id: "attachments", source: "attachments", content: contextPrefix, relevance: 1, priority: 90 }
+    ];
+    if (symbolContextBlock) {
+      contextItems.push({
+        id: "symbols",
+        source: "workspace",
+        content: symbolContextBlock,
+        relevance: 0.95,
+        priority: 85
+      });
+    }
+
+    const selectedContext = this.contextEngine.select(contextItems, contextBudget);
     const userContent = buildUserContent(
       composeUserMessage(selectedContext.items.map((item) => item.content), text),
       images
@@ -1670,6 +1862,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             search_codebase: "جستجو در کدها",
             semantic_search: "جستجوی معنایی در پروژه",
             delegate_search: "جستجوی واگذارشده در پروژه",
+            delegate_to_subagents: "بررسی موازی توسط ساب‌اجنت‌ها",
             create_plan: "ایجاد برنامهٔ ساخت‌یافته",
             get_plan: "خواندن برنامهٔ ساخت‌یافته",
             update_plan_step: "به‌روزرسانی مرحلهٔ برنامه",
@@ -1888,7 +2081,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     const resultBlocks: ContentBlock[] = [];
-    const readTools = new Set(["read_file", "list_codebase", "list_files", "search_codebase"]);
     const pendingAtCompletion = this.taskList.filter((t) => t.status === "pending" || t.status === "in_progress");
     const completionAccepted =
       toolUseBlocks.length === 1 && toolUseBlocks[0].name === "task_complete" && pendingAtCompletion.length === 0;
@@ -1936,6 +2128,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const loopNotice = `[Tool Call Suppressed: You have already executed '${call.name}' with these exact arguments and received the result above. Repeating identical calls is prohibited. Please analyze the information already obtained and either make the required edits with search_replace/write_file or provide your final response to the user.]`;
         this.postToWebview({ type: "toolResult", id: call.id, content: loopNotice, isError: false });
         return { type: "tool_result", tool_use_id: call.id, content: loopNotice };
+      }
+
+      // Session result caching: avoid repeated broad searches
+      if (call.name === "search_codebase" && typeof call.input?.pattern === "string") {
+        const cached = this.agentRuntime.getCachedResult(call.input.pattern);
+        if (cached) {
+          logInfo(`Serving session-cached search result for '${call.input.pattern}'`);
+          this.postToWebview({ type: "toolCall", id: call.id, name: call.name, input: call.input });
+          this.postToWebview({ type: "toolResult", id: call.id, content: cached, isError: false });
+          return { type: "tool_result", tool_use_id: call.id, content: `[SESSION CACHED SEARCH RESULT]:\n${cached}` };
+        }
       }
 
 
@@ -2041,6 +2244,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               type: "sessionReviewUpdate",
               files: ReviewManager.getInstance().getModifiedFiles()
             } as any);
+
+            // Re-index modified file, invalidate caches, and run closed-loop validation
+            try {
+              const postEdit = await this.agentRuntime.postEditValidation([filePath]);
+              if (postEdit.hasErrors) {
+                output += `\n\n[CLOSED-LOOP VALIDATION: Your modification introduced compiler or linter errors in ${filePath}. Analyze these errors and repair them using search_replace before finishing:\n${postEdit.diagnosticSummary}]`;
+              }
+            } catch (err: any) {
+              logWarn(`Post-edit validation skipped: ${err?.message ?? err}`);
+            }
+
+            // Invalidate file in intelligence cache
+            this.agentRuntime.invalidateFileContext(filePath);
+
             // Allow re-reading modified file without false loop detection
             for (let i = executedSignatures.length - 1; i >= 0; i--) {
               if (executedSignatures[i].startsWith("read_file:") && executedSignatures[i].includes(`"${filePath}"`)) {
@@ -2065,6 +2282,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               await openWrittenFile(filePath);
             }
           }
+        }
+
+        if (call.name === "search_codebase" && typeof call.input?.pattern === "string") {
+          this.agentRuntime.cacheResult(call.input.pattern, output);
         }
 
         // Security boundary: protect LLM against prompt injection embedded in file/command/mcp contents
@@ -2203,6 +2424,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         <span id="usage-info">0 tokens</span>
       </div>
       <div id="activity-footer" class="hidden"><span class="activity-spinner"></span><span id="activity-footer-text">Working…</span><button type="button" id="activity-stop-btn">Stop</button></div>
+      <div id="drop-overlay" class="drop-overlay hidden">
+        <div class="drop-overlay-box">
+          <span class="drop-icon">📥</span>
+          <span class="drop-text" data-i18n="drop_hint">فایل‌ها یا پوشه‌ها را اینجا رها کنید<br><small>Drop files or folders here</small></span>
+        </div>
+      </div>
       <div id="attachments-bar" class="hidden"></div>
       <div class="chat-input-wrapper">
         <form id="input-form" class="copilot-input-box">
@@ -2228,7 +2455,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 <button type="button" data-context="git">Git changes</button>
                 <button type="button" data-context="codebase">Codebase</button>
               </div>
-              <button type="button" id="attach-btn" class="tool-icon-btn hidden" title="ضمیمه فایل یا تصویر / Attach file or image" data-i18n-title="attach_btn_title">＋</button>
+              <button type="button" id="attach-btn" class="tool-icon-btn" title="ضمیمه فایل یا تصویر / Attach file or image" data-i18n-title="attach_btn_title">＋</button>
+              <button type="button" id="attach-folder-btn" class="tool-icon-btn" title="ضمیمه پوشه / Attach folder">▱</button>
               <button type="button" id="attach-active-btn" class="tool-icon-btn" title="ضمیمه فایل فعال ادیتور / Attach active editor file" data-i18n-title="attach_active_btn_title">▱</button>
               <button type="button" id="context-quick-btn" class="tool-icon-btn badge-btn" title="ارجاع کانتکست (#file, #selection, #git)">#</button>
               <button type="button" id="slash-quick-btn" class="tool-icon-btn badge-btn" title="دستورات اسلش (/fix, /explain, /tests)">/</button>
@@ -2321,6 +2549,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 <button type="button" id="test-conn-btn" data-i18n="test_conn_btn">🔌 Test Connection / تست اتصال</button>
                 <span id="test-conn-status" class="test-status"></span>
               </div>
+              <div class="api-usage-card" id="api-usage-card">
+                <div class="api-usage-header">
+                  <div><strong>وضعیت مصرف API</strong><span id="api-usage-key"></span></div>
+                  <button type="button" id="refresh-usage-btn">↻ بروزرسانی</button>
+                </div>
+                <div id="api-usage-content" class="api-usage-empty">برای مشاهده سهمیه و مصرف، روی بروزرسانی کلیک کنید.</div>
+              </div>
             </div>
             <div class="settings-section">
               <div class="section-title" data-i18n="params_section_title">Parameters & Tools / پارامترها و ابزارها</div>
@@ -2391,44 +2626,52 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               </div>
             </div>
             <div class="settings-section">
-              <div class="section-title">Skills / مهارت‌ها</div>
-              <div class="setting-hint">Reusable expertise such as Laravel development. Skills are independent from MCP tools and can be used alongside them.</div>
+              <div class="section-title" data-i18n="skills_section_title">مهارت‌ها</div>
+              <div class="setting-hint" data-i18n="skills_hint">تخصص‌های قابل استفاده مجدد، مانند توسعه لاراول. مهارت‌ها مستقل از ابزارهای MCP هستند و می‌توانند در کنار آن‌ها استفاده شوند.</div>
               <div id="skills-list" class="skills-list"></div>
               <div class="test-conn-row">
-                <button type="button" id="add-skill-btn" class="secondary-btn">＋ Add Skill / افزودن مهارت</button>
+                <button type="button" id="add-skill-btn" class="secondary-btn" data-i18n="add_skill_btn">＋ افزودن مهارت</button>
                 <span id="skills-status" class="test-status"></span>
               </div>
             </div>
             <div class="settings-section">
-              <div class="section-title">Model Context Protocol (MCP) / سرورهای ابزار</div>
+              <div class="section-title" data-i18n="mcp_section_title">پروتکل زمینه مدل (MCP)</div>
               <div class="setting-row">
-                <label for="cfg-mcp-servers">MCP Servers Configuration (JSON):</label>
-                <textarea id="cfg-mcp-servers" rows="4" placeholder='{"filesystem": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "\${workspaceFolder}"]}}' style="width:100%;font-family:monospace;font-size:11px;resize:vertical;box-sizing:border-box;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border);border-radius:4px;padding:6px;"></textarea>
-                <div class="setting-hint">پیکربندی سرورهای MCP (JSON). توکن‌های امنیتی Figma به صورت خودکار از مخزن امن در درخواست‌ها تزریق می‌شوند.</div>
+                <label for="cfg-mcp-servers" data-i18n="mcp_config_label">پیکربندی سرورهای MCP (JSON):</label>
+                <textarea id="cfg-mcp-servers" rows="4" placeholder='{"filesystem": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "\${workspaceFolder}"]}}' style="width:100%;font-family:monospace;font-size:11px;resize:vertical;box-sizing:border-box;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border);border-radius:4px;padding:6px;direction:ltr;text-align:left;"></textarea>
+                <div class="setting-hint" data-i18n="mcp_hint">پیکربندی سرورهای MCP با فرمت JSON. توکن‌های امنیتی Figma به‌صورت خودکار از مخزن امن به درخواست‌ها افزوده می‌شوند.</div>
               </div>
 
               <!-- Figma MCP Integration & Account Auth -->
-              <div class="figma-mcp-card" id="figma-mcp-card">
-                <div class="figma-card-header">
+              <div class="figma-mcp-card" id="figma-mcp-card" style="direction:rtl;text-align:right;">
+                <div class="figma-card-header" style="display:flex;align-items:center;justify-content:space-between;direction:rtl;">
                   <div class="figma-card-title">
                     <span class="figma-icon">🎨</span>
-                    <strong>اتصال به اکانت Figma (حل مشکل Rate Limit)</strong>
+                    <strong>اتصال به اکانت <bdi>Figma</bdi> (حل مشکل <bdi>Rate Limit</bdi>)</strong>
                   </div>
                   <span id="figma-auth-badge" class="figma-badge disconnected">⚪ اکانت متصل نیست</span>
                 </div>
-                <div class="setting-hint figma-hint">
-                  کلیدهای دستی API فیگما سقف بسیار پایینی دارند و فوراً به خطای Rate Limit (429) برمی‌خورند. با ورود مستقیم به اکانت فیگما از طریق OAuth، یا اتصال به اپلیکیشن دسکتاپ Figma در حالت Dev Mode، می‌توانید بدون ریت‌لیمیت کار کنید.
+                <div class="setting-hint figma-hint" style="direction:rtl;text-align:right;line-height:1.6;">
+                  کلیدهای دستی <bdi>API</bdi> فیگما سقف بسیار پایینی دارند و فوراً به خطای <bdi>Rate Limit (429)</bdi> برمی‌خورند. با ورود مستقیم به اکانت فیگما از طریق <bdi>OAuth</bdi>، یا اتصال به اپلیکیشن دسکتاپ <bdi>Figma</bdi> در حالت <bdi>Dev Mode</bdi>، می‌توانید بدون ریت‌لیمیت کار کنید.
                 </div>
                 <div class="figma-actions-row">
-                  <button type="button" id="figma-login-btn" class="secondary-btn figma-btn">🔑 ورود با اکانت فیگما (OAuth Login)</button>
+                  <button type="button" id="figma-login-btn" class="secondary-btn figma-btn">🔑 ورود با اکانت فیگما <bdi>(OAuth Login)</bdi></button>
                   <button type="button" id="figma-logout-btn" class="secondary-btn figma-btn hidden">خروج از اکانت فیگما</button>
-                  <button type="button" id="figma-desktop-btn" class="secondary-btn figma-btn">🖥️ اتصال به Figma Desktop (لوکال)</button>
+                  <button type="button" id="figma-desktop-btn" class="secondary-btn figma-btn">🖥️ اتصال به <bdi>Figma Desktop</bdi> (لوکال)</button>
+                </div>
+                <div class="setting-row toggle-row" style="margin-top:10px;">
+                  <label><input type="checkbox" id="cfg-figma-proxy-enabled" /> فعال‌سازی پروکسی برای اتصال‌های آنلاین <bdi>Figma</bdi></label>
+                </div>
+                <div class="setting-row" id="figma-proxy-url-row">
+                  <label for="cfg-figma-proxy-url">آدرس پروکسی:</label>
+                  <input type="password" id="cfg-figma-proxy-url" dir="ltr" placeholder="http://127.0.0.1:10809" autocomplete="off" />
+                  <div class="setting-hint">فرمت‌های <bdi>http://</bdi> و <bdi>https://</bdi> پشتیبانی می‌شوند. اتصال محلی Figma Desktop از پروکسی عبور نمی‌کند.</div>
                 </div>
                 <div id="figma-auth-status" class="test-status" style="margin-top:6px;"></div>
               </div>
 
               <div class="test-conn-row" style="margin-top:6px;">
-                <button type="button" id="test-mcp-btn" class="secondary-btn">🔌 تست سرورهای MCP / Test MCP</button>
+                <button type="button" id="test-mcp-btn" class="secondary-btn" style="white-space:nowrap;">🔌 تست سرورهای MCP / Test MCP</button>
                 <span id="test-mcp-status" class="test-status"></span>
               </div>
             </div>

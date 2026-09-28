@@ -197,6 +197,41 @@ Module.prototype.require = function (id) {
       StatusBarAlignment: {
         Left: 1,
         Right: 2
+      },
+      Disposable: class {
+        constructor(callOnDispose) {
+          this.callOnDispose = callOnDispose;
+        }
+        dispose() {
+          if (typeof this.callOnDispose === "function") this.callOnDispose();
+        }
+        static from(...disposables) {
+          return new this(() => {
+            for (const d of disposables) {
+              if (d && typeof d.dispose === "function") d.dispose();
+            }
+          });
+        }
+      },
+      EventEmitter: class {
+        constructor() {
+          this.listeners = [];
+          this.event = (listener) => {
+            this.listeners.push(listener);
+            return {
+              dispose: () => {
+                const idx = this.listeners.indexOf(listener);
+                if (idx !== -1) this.listeners.splice(idx, 1);
+              }
+            };
+          };
+        }
+        fire(data) {
+          for (const l of this.listeners) l(data);
+        }
+        dispose() {
+          this.listeners = [];
+        }
       }
     };
   }

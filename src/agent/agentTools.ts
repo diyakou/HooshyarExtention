@@ -1,6 +1,7 @@
 import { getPlannerAgent, PlanStep } from "./planner";
 import { getSearchAgent } from "./searchAgent";
 import { getVerificationAgent } from "./verificationAgent";
+import { getSubAgentOrchestrator, SubAgentTask } from "./subAgentOrchestrator";
 
 export async function createPlanTool(input: { goal?: string; context?: string }): Promise<string> {
   const goal = input.goal?.trim();
@@ -48,6 +49,19 @@ export async function delegateSearchTool(input: { query?: string; scope?: string
     results,
     summary: await getSearchAgent().summarizeResults(results)
   }, null, 2);
+}
+
+export async function delegateToSubAgentsTool(input: { goal?: string; tasks?: SubAgentTask[]; maxResultsPerAgent?: number }): Promise<string> {
+  const goal = input.goal?.trim();
+  if (!goal) throw new Error("delegate_to_subagents requires 'goal'.");
+  if (!Array.isArray(input.tasks) || input.tasks.length === 0) throw new Error("delegate_to_subagents requires 1 to 4 specialist tasks.");
+  const allowed = new Set(["architecture", "implementation", "tests", "security", "performance", "custom"]);
+  const tasks = input.tasks.slice(0, 4).map((task) => ({
+    role: allowed.has(task?.role) ? task.role : "custom",
+    objective: typeof task?.objective === "string" ? task.objective : undefined,
+    scope: typeof task?.scope === "string" ? task.scope : undefined
+  })) as SubAgentTask[];
+  return JSON.stringify(await getSubAgentOrchestrator().run(goal, tasks, input.maxResultsPerAgent), null, 2);
 }
 
 export async function verifyChangesTool(input: { files?: string[] }): Promise<string> {

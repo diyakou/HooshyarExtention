@@ -92,6 +92,44 @@ export function normalizeModelsUrl(baseUrl: string): string {
   return `${apiRoot}/v1/models`;
 }
 
+export function normalizeUsageUrl(baseUrl: string): string {
+  const trimmed = baseUrl.trim().replace(/\/+$/, "");
+  if (/\/v1\/(?:messages?\/)?usage$/i.test(trimmed) || /\/v1\/token\/usage$/i.test(trimmed)) return trimmed;
+  const apiRoot = trimmed.replace(/\/(?:chat\/completions?|messages?)$/i, "");
+  if (/\/v1$/i.test(apiRoot)) return `${apiRoot}/usage`;
+  return `${apiRoot.replace(/\/v1$/i, "")}/v1/usage`;
+}
+
+export interface ApiUsageResponse {
+  authenticated: boolean;
+  key_masked?: string; key_name?: string; plan?: string; managed?: boolean; status?: string; billing_mode?: string;
+  daily_limit?: number; used_today?: number; remaining_today?: number | null; usage_percent?: number; reset_at?: string | null;
+  context_limit?: number;
+  context?: { limit?: number; last_request_used?: number; last_request_remaining?: number; last_request_percent?: number } | null;
+  started_at?: string | null; expires_at?: string | null; user_token_balance?: number | null;
+  lifetime?: { total_requests?: number; total_billable_tokens?: number; total_input_tokens?: number; total_output_tokens?: number } | null;
+  last_request?: { request_id?: string; model?: string; input_tokens?: number; output_tokens?: number; customer_billable_tokens?: number; created_at?: string } | null;
+  billing?: Record<string, unknown> | null;
+  limits?: { rpm?: number; concurrency?: number; max_context_tokens?: number; max_output_tokens?: number } | null;
+}
+
+export async function fetchApiUsage(config: ApiClientConfig, signal?: AbortSignal): Promise<ApiUsageResponse> {
+  const response = await fetch(normalizeUsageUrl(config.baseUrl), { method: "GET", headers: buildRequestHeaders(config), signal });
+  if (!response.ok) {
+    const raw = (await response.text()).slice(0, 300);
+    let detail = raw;
+    try {
+      const payload: any = JSON.parse(raw);
+      detail = typeof payload?.detail === "string" ? payload.detail : raw;
+    } catch { /* preserve the text response */ }
+    const friendly = response.status === 401 ? "API key is invalid or missing." : `Usage request failed (${response.status}).`;
+    throw new Error(`${friendly}${detail ? ` ${detail}` : ""}`);
+  }
+  const payload = await response.json() as ApiUsageResponse;
+  if (!payload || typeof payload !== "object") throw new Error("Usage endpoint returned an invalid response.");
+  return payload;
+}
+
 export async function fetchAvailableModels(config: ApiClientConfig, signal?: AbortSignal): Promise<string[]> {
   const response = await fetch(normalizeModelsUrl(config.baseUrl), {
     method: "GET",

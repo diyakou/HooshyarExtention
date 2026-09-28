@@ -5,6 +5,7 @@ import * as readline from "readline";
 import * as vscode from "vscode";
 import { ToolDefinition } from "./types";
 import { logDebug, logError, logInfo, logWarn } from "./logger";
+import { getFigmaProxyDispatcher } from "./figmaProxy";
 
 export interface McpServerConfig {
   command?: string;
@@ -104,8 +105,14 @@ export class McpManager {
   private serverStatuses = new Map<string, McpServerStatus>();
   private toolMapping = new Map<string, { serverName: string; originalToolName: string }>();
   private sequence = 0;
+  private remoteSessions = new Map<string, { id?: string; protocolVersion: string; initialized: boolean; url: string }>();
   private figmaTokenProvider?: () => Promise<string | null>;
   private figmaTokenRefresher?: () => Promise<string | null>;
+  private figmaProxySettings: () => { enabled: boolean; url: string } = () => ({ enabled: false, url: "" });
+
+  public setFigmaProxyProvider(provider: () => { enabled: boolean; url: string }): void {
+    this.figmaProxySettings = provider;
+  }
 
   public setFigmaTokenProvider(
     provider: () => Promise<string | null>,
@@ -300,6 +307,7 @@ export class McpManager {
     this.pending.clear();
     this.serverStatuses.clear();
     this.toolMapping.clear();
+    this.remoteSessions.clear();
   }
 
   private cleanupServer(serverName: string): void {
@@ -338,12 +346,25 @@ export class McpManager {
     signal?: AbortSignal,
     isRetry = false
   ): Promise<any> {
+    if (method !== "initialize" && method !== "notifications/initialized") {
+      await this.ensureRemoteInitialized(serverName, url, headers, signal);
+    }
     const id = `${serverName}-${++this.sequence}`;
-    const payload = { jsonrpc: "2.0", id, method, params };
+    const isNotification = method === "notifications/initialized";
+    const payload = isNotification
+      ? { jsonrpc: "2.0", method, params }
+      : { jsonrpc: "2.0", id, method, params };
     const wsFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     const resolvedUrl = resolveVariables(url, wsFolder);
 
-    const mergedHeaders: Record<string, string> = { ...(headers || {}) };
+    const existingSession = this.remoteSessions.get(serverName);
+    const session = existingSession?.url === resolvedUrl ? existingSession : undefined;
+    if (existingSession && !session) this.remoteSessions.delete(serverName);
+    const mergedHeaders: Record<string, string> = {
+      ...(headers || {}),
+      "MCP-Protocol-Version": session?.protocolVersion || "2025-03-26"
+    };
+    if (session?.id) mergedHeaders["Mcp-Session-Id"] = session.id;
     const isFigma = serverName.toLowerCase() === "figma" || resolvedUrl.includes("mcp.figma.com");
 
     if (isFigma && !mergedHeaders["Authorization"] && !mergedHeaders["authorization"] && this.figmaTokenProvider) {
@@ -357,6 +378,10 @@ export class McpManager {
       }
     }
 
+    const proxy = isFigma && !resolvedUrl.startsWith("http://127.0.0.1") && !resolvedUrl.startsWith("http://localhost")
+      ? this.figmaProxySettings()
+      : { enabled: false, url: "" };
+    const dispatcher = getFigmaProxyDispatcher(proxy.enabled, proxy.url);
     const res = await fetch(resolvedUrl, {
       method: "POST",
       headers: {
@@ -365,8 +390,20 @@ export class McpManager {
         ...mergedHeaders
       },
       body: JSON.stringify(payload),
-      signal
-    });
+      signal,
+      ...(dispatcher ? { dispatcher } : {})
+    } as RequestInit);
+
+    const receivedSessionId = res.headers.get("mcp-session-id");
+    if (receivedSessionId) {
+      const current = this.remoteSessions.get(serverName);
+      this.remoteSessions.set(serverName, {
+        id: receivedSessionId,
+        protocolVersion: current?.protocolVersion || "2025-03-26",
+        initialized: current?.initialized ?? method === "initialize",
+        url: resolvedUrl
+      });
+    }
 
     if (!res.ok) {
       if (res.status === 401 && isFigma && !isRetry && this.figmaTokenRefresher) {
@@ -394,8 +431,14 @@ export class McpManager {
         );
       }
 
+      if (res.status === 404 && session?.id && !isRetry) {
+        this.remoteSessions.delete(serverName);
+        return this.remoteRequest(serverName, url, headers, method, params, signal, true);
+      }
       throw new Error(`Remote MCP server '${serverName}' returned HTTP ${res.status}: ${await res.text()}`);
     }
+
+    if (res.status === 202 || res.status === 204 || isNotification) return undefined;
 
     const contentType = res.headers.get("content-type") || "";
     if (contentType.includes("application/json")) {
@@ -405,12 +448,57 @@ export class McpManager {
     }
     const text = await res.text();
     try {
-      const parsed = JSON.parse(text);
+      const parsed = contentType.includes("text/event-stream")
+        ? this.parseSseJsonRpc(text, id)
+        : JSON.parse(text);
       if (parsed.error) throw new Error(parsed.error.message || "Remote MCP request failed.");
       return parsed.result;
-    } catch {
-      return text;
+    } catch (err: any) {
+      if (err instanceof SyntaxError) return text;
+      throw err;
     }
+  }
+
+  private async ensureRemoteInitialized(
+    serverName: string,
+    url: string,
+    headers?: Record<string, string>,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const resolvedUrl = resolveVariables(url, vscode.workspace.workspaceFolders?.[0]?.uri.fsPath);
+    const existing = this.remoteSessions.get(serverName);
+    if (existing?.initialized && existing.url === resolvedUrl) return;
+    if (existing && existing.url !== resolvedUrl) this.remoteSessions.delete(serverName);
+    const protocolVersion = "2025-03-26";
+    this.remoteSessions.set(serverName, { protocolVersion, initialized: false, url: resolvedUrl });
+    try {
+      const result = await this.remoteRequest(serverName, url, headers, "initialize", {
+        protocolVersion,
+        capabilities: {},
+        clientInfo: { name: "Hooshyar", version: "0.9.1" }
+      }, signal);
+      const negotiated = typeof result?.protocolVersion === "string" ? result.protocolVersion : protocolVersion;
+      const session = this.remoteSessions.get(serverName);
+      this.remoteSessions.set(serverName, { id: session?.id, protocolVersion: negotiated, initialized: true, url: resolvedUrl });
+      await this.remoteRequest(serverName, url, headers, "notifications/initialized", {}, signal);
+    } catch (err) {
+      this.remoteSessions.delete(serverName);
+      throw err;
+    }
+  }
+
+  private parseSseJsonRpc(text: string, requestId: string): any {
+    const messages = text
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trim())
+      .filter(Boolean)
+      .map((data) => JSON.parse(data));
+    const matched = messages.find((message) => String(message?.id) === String(requestId));
+    if (matched) return matched;
+    const response = messages.find((message) => message?.result !== undefined || message?.error);
+    if (response) return response;
+    throw new Error("Remote MCP server returned an SSE response without a JSON-RPC result.");
   }
 
   private rawRequest(

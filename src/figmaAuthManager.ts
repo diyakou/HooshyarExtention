@@ -3,11 +3,14 @@ import * as http from "http";
 import { URL } from "url";
 import * as vscode from "vscode";
 import { logError, logInfo, logWarn } from "./logger";
+import { getFigmaProxyDispatcher } from "./figmaProxy";
 
 export interface FigmaTokens {
   accessToken: string;
   refreshToken?: string;
   expiresAt?: number; // epoch ms
+  /** Login/session lifetime. Access tokens may rotate sooner without ending the session. */
+  sessionExpiresAt?: number;
   scope?: string;
   tokenType?: string;
   user?: {
@@ -55,6 +58,7 @@ export const FIGMA_ALLOWLISTED_CLIENT_NAME = "Codex";
 
 const SECRET_KEY = "hooshyar.figma_oauth_tokens";
 const DEFAULT_PORTS = [19876, 19877, 19878, 0];
+export const FIGMA_SESSION_LIFETIME_MS = 90 * 24 * 60 * 60 * 1000;
 
 export function generatePKCE(): { codeVerifier: string; codeChallenge: string } {
   const verifierBytes = crypto.randomBytes(32);
@@ -90,7 +94,16 @@ export class FigmaAuthManager {
   private pendingFlows = new Map<string, PendingOAuthFlow>();
   private cachedTokens: FigmaTokens | null = null;
 
-  constructor(private readonly secretStorage: SimpleSecretStorage) {}
+  constructor(
+    private readonly secretStorage: SimpleSecretStorage,
+    private readonly proxySettings: () => { enabled: boolean; url: string } = () => ({ enabled: false, url: "" })
+  ) {}
+
+  private figmaFetch(url: string, init: RequestInit): Promise<Response> {
+    const proxy = this.proxySettings();
+    const dispatcher = getFigmaProxyDispatcher(proxy.enabled, proxy.url);
+    return fetch(url, { ...init, ...(dispatcher ? { dispatcher } : {}) } as RequestInit);
+  }
 
   public async getTokens(): Promise<FigmaTokens | null> {
     if (this.cachedTokens) {
@@ -100,6 +113,10 @@ export class FigmaAuthManager {
       const raw = await this.secretStorage.get(SECRET_KEY);
       if (!raw) return null;
       const parsed = JSON.parse(raw) as FigmaTokens;
+      if (!parsed.sessionExpiresAt) {
+        parsed.sessionExpiresAt = Date.now() + FIGMA_SESSION_LIFETIME_MS;
+        await this.secretStorage.store(SECRET_KEY, JSON.stringify(parsed));
+      }
       this.cachedTokens = parsed;
       return parsed;
     } catch (err) {
@@ -119,7 +136,7 @@ export class FigmaAuthManager {
     }
     return {
       authenticated: true,
-      expiresAt: tokens.expiresAt,
+      expiresAt: tokens.sessionExpiresAt ?? tokens.expiresAt,
       user: tokens.user,
       scope: tokens.scope
     };
@@ -159,7 +176,7 @@ export class FigmaAuthManager {
         params.set("client_secret", current.clientSecret);
       }
 
-      const res = await fetch(FIGMA_TOKEN_ENDPOINT, {
+      const res = await this.figmaFetch(FIGMA_TOKEN_ENDPOINT, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: params.toString()
@@ -186,6 +203,7 @@ export class FigmaAuthManager {
         accessToken: data.access_token,
         refreshToken: data.refresh_token || current.refreshToken,
         expiresAt: data.expires_in ? Date.now() + data.expires_in * 1000 : current.expiresAt,
+        sessionExpiresAt: current.sessionExpiresAt ?? Date.now() + FIGMA_SESSION_LIFETIME_MS,
         scope: data.scope || current.scope,
         tokenType: data.token_type || current.tokenType || "Bearer"
       };
@@ -200,8 +218,12 @@ export class FigmaAuthManager {
   }
 
   public async saveTokens(tokens: FigmaTokens): Promise<void> {
-    this.cachedTokens = tokens;
-    await this.secretStorage.store(SECRET_KEY, JSON.stringify(tokens));
+    const normalized = {
+      ...tokens,
+      sessionExpiresAt: tokens.sessionExpiresAt ?? Date.now() + FIGMA_SESSION_LIFETIME_MS
+    };
+    this.cachedTokens = normalized;
+    await this.secretStorage.store(SECRET_KEY, JSON.stringify(normalized));
   }
 
   public async logout(): Promise<void> {
@@ -232,7 +254,7 @@ export class FigmaAuthManager {
       token_endpoint_auth_method: "none"
     };
 
-    const res = await fetch(FIGMA_REGISTRATION_ENDPOINT, {
+    const res = await this.figmaFetch(FIGMA_REGISTRATION_ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
@@ -401,7 +423,7 @@ export class FigmaAuthManager {
           tokenParams.set("client_secret", matchingFlow.clientSecret);
         }
 
-        const tokenRes = await fetch(FIGMA_TOKEN_ENDPOINT, {
+        const tokenRes = await this.figmaFetch(FIGMA_TOKEN_ENDPOINT, {
           method: "POST",
           headers: { "Content-Type": "application/x-www-form-urlencoded" },
           body: tokenParams.toString()
@@ -430,6 +452,7 @@ export class FigmaAuthManager {
           accessToken: tokenJson.access_token,
           refreshToken: tokenJson.refresh_token,
           expiresAt: tokenJson.expires_in ? Date.now() + tokenJson.expires_in * 1000 : undefined,
+          sessionExpiresAt: Date.now() + FIGMA_SESSION_LIFETIME_MS,
           scope: tokenJson.scope,
           tokenType: tokenJson.token_type || "Bearer",
           clientId: matchingFlow.clientId,

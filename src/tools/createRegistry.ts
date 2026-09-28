@@ -66,10 +66,10 @@ export function classifyTool(name: string): {
   if (name === "rename_symbol") {
     return { category: "symbol", risk: "write", parallelSafe: false };
   }
-  if (name === "get_workspace_symbols" || name === "get_diagnostics" || name.startsWith("find_") || name === "get_hover" || name === "get_document_symbols" || name === "get_call_hierarchy" || name === "get_related_files" || name === "get_symbol_dependencies" || name === "get_symbol_dependents") {
-    return { category: "symbol", risk: "read", parallelSafe: isParallelSafeTool(name) };
+  if (name === "get_workspace_symbols" || name === "get_diagnostics" || name.startsWith("find_") || name === "get_hover" || name === "get_document_symbols" || name === "get_call_hierarchy" || name === "get_related_files" || name === "get_symbol_dependencies" || name === "get_symbol_dependents" || name === "get_symbol" || name === "get_file_outline" || name === "get_related_tests" || name === "get_project_map") {
+    return { category: "symbol", risk: "read", parallelSafe: true };
   }
-  if (name === "search_codebase" || name === "semantic_search" || name === "delegate_search" || name === "list_codebase") {
+  if (name === "search_codebase" || name === "semantic_search" || name === "delegate_search" || name === "delegate_to_subagents" || name === "list_codebase") {
     return { category: "search", risk: "read", parallelSafe: isParallelSafeTool(name) };
   }
   if (name === "fetch_webpage") {

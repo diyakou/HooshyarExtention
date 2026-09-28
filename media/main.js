@@ -8,6 +8,7 @@
   const taskListEl = document.getElementById("tasklist");
   const attachmentsBar = document.getElementById("attachments-bar");
   const attachBtn = document.getElementById("attach-btn");
+  const attachFolderBtn = document.getElementById("attach-folder-btn");
   const attachTxtMdBtn = document.getElementById("attach-txt-md-btn");
   const attachActiveBtn = document.getElementById("attach-active-btn");
   const sendBtn = document.getElementById("send-btn");
@@ -120,6 +121,14 @@
       auto_approve_commands_label: "⚡ تایید خودکار دستورات ترمینال (بدون نیاز به تایید دستی)",
       auto_approve_mode_label: "حالت تایید خودکار عملیات:",
       auto_include_label: "ضمیمه خودکار محتوای فایل باز ادیتور",
+      skills_section_title: "مهارت‌ها",
+      skills_hint: "تخصص‌های قابل استفاده مجدد، مانند توسعه لاراول. مهارت‌ها مستقل از ابزارهای MCP هستند و می‌توانند در کنار آن‌ها استفاده شوند.",
+      add_skill_btn: "＋ افزودن مهارت",
+      no_skills: "هنوز مهارتی اضافه نشده است",
+      remove_skill: "حذف مهارت",
+      mcp_section_title: "پروتکل زمینه مدل (MCP)",
+      mcp_config_label: "پیکربندی سرورهای MCP (JSON):",
+      mcp_hint: "پیکربندی سرورهای MCP با فرمت JSON. توکن‌های امنیتی Figma به‌صورت خودکار از مخزن امن به درخواست‌ها افزوده می‌شوند.",
       save_btn: "ذخیره تنظیمات",
       cancel_btn: "بستن",
       help_modal_title: "راهنما و تهیه API هوشیار",
@@ -194,6 +203,14 @@
       auto_approve_commands_label: "⚡ Auto-Approve Terminal Commands",
       auto_approve_mode_label: "Auto-Approve Mode:",
       auto_include_label: "Auto-attach active editor file content",
+      skills_section_title: "Skills",
+      skills_hint: "Reusable expertise such as Laravel development. Skills are independent from MCP tools and can be used alongside them.",
+      add_skill_btn: "＋ Add Skill",
+      no_skills: "No skills added yet",
+      remove_skill: "Remove skill",
+      mcp_section_title: "Model Context Protocol (MCP)",
+      mcp_config_label: "MCP server configuration (JSON):",
+      mcp_hint: "Configure MCP servers as JSON. Figma security tokens are automatically injected from secure storage.",
       save_btn: "Save Settings",
       cancel_btn: "Close",
       help_modal_title: "Hooshyar API Guide & Support",
@@ -697,6 +714,7 @@
     list_codebase: { icon: "🗂️", verb: "کاوش ساختار پروژه", enVerb: "Explore codebase" },
     search_codebase: { icon: "🔍", verb: "جستجو در کدها", enVerb: "Search codebase" },
     semantic_search: { icon: "⌕", verb: "جستجوی معنایی", enVerb: "Semantic search" },
+    delegate_to_subagents: { icon: "⌘", verb: "بررسی موازی ساب‌اجنت‌ها", enVerb: "Parallel sub-agent research" },
     find_symbol: { icon: "#", verb: "یافتن نماد", enVerb: "Find symbol" },
     find_definition: { icon: "→", verb: "یافتن تعریف", enVerb: "Find definition" },
     find_references: { icon: "↔", verb: "یافتن استفاده‌ها", enVerb: "Find references" },
@@ -940,6 +958,11 @@
       const details = document.createElement("div");
       details.className = "step-details";
 
+      const errorSummary = document.createElement("div");
+      errorSummary.className = "step-error-summary hidden";
+      main.appendChild(summaryRow);
+      main.appendChild(errorSummary);
+
       if ((name === "search_replace" || name === "write_file") && input && input.path) {
         const filePath = String(input.path).trim();
         const toolbar = document.createElement("div");
@@ -993,7 +1016,6 @@
       outBlock.appendChild(outPre);
       details.appendChild(outBlock);
 
-      main.appendChild(summaryRow);
       main.appendChild(details);
 
       stepEl.appendChild(indicator);
@@ -1020,6 +1042,7 @@
         stepEl,
         pill,
         outPre,
+        errorSummary,
         isCompleted: this.isHistory
       };
       this.steps.push(stepObj);
@@ -1041,9 +1064,22 @@
 
       step.pill.classList.remove("running");
       step.pill.classList.add(isError ? "error" : "ok");
-      step.pill.textContent = summarizeResultPersian(step.name, content, isError);
+      const fullResult = (content || "").trim();
+      if (isError) {
+        const firstLine = fullResult.split("\n").find((line) => line.trim()) || (currentLang === "fa" ? "علت نامشخص" : "Unknown cause");
+        step.pill.textContent = currentLang === "fa" ? "✕ خطا" : "✕ Failed";
+        step.pill.title = fullResult;
+        step.errorSummary.textContent = firstLine;
+        step.errorSummary.title = fullResult;
+        step.errorSummary.classList.remove("hidden");
+      } else {
+        step.pill.textContent = summarizeResultPersian(step.name, content, false);
+        step.pill.removeAttribute("title");
+        step.errorSummary.textContent = "";
+        step.errorSummary.classList.add("hidden");
+      }
 
-      step.outPre.textContent = (content || "").trim() || "(بدون خروجی / no output)";
+      step.outPre.textContent = fullResult || "(بدون خروجی / no output)";
       if (isError) {
         step.outPre.classList.add("error");
         this.hasError = true;
@@ -1135,7 +1171,9 @@
       this.statusIconEl.textContent = this.hasError ? "⚠" : "✓";
       this.titleEl.textContent = labels.join(" · ") || (isFa ? "جزئیات عملیات" : "Operation details");
       this.badgeEl.textContent = String(total);
-      this.setExpanded(Boolean(files.size || commands.length || this.hasError));
+      // Completed runs stay as one compact row. The user can expand details explicitly.
+      this.cardEl.classList.add("compact-complete");
+      this.setExpanded(this.hasError);
     }
   }
 
@@ -1876,6 +1914,7 @@
       return;
     }
     taskListEl.classList.remove("hidden");
+    if (tasks.every((task) => task.status === "completed")) planCollapsed = true;
     taskListEl.innerHTML = "";
 
     const header = document.createElement("div");
@@ -2059,6 +2098,7 @@
   attachBtn.addEventListener("click", () => {
     vscode.postMessage({ type: "attachFile" });
   });
+  if (attachFolderBtn) attachFolderBtn.addEventListener("click", () => vscode.postMessage({ type: "attachFolder" }));
 
   if (attachTxtMdBtn) {
     attachTxtMdBtn.addEventListener("click", () => {
@@ -2096,18 +2136,28 @@
   chatPane.addEventListener("dragover", (e) => {
     e.preventDefault();
     chatPane.classList.add("dragover");
+    document.getElementById("drop-overlay")?.classList.remove("hidden");
   });
   chatPane.addEventListener("dragleave", () => {
     chatPane.classList.remove("dragover");
+    document.getElementById("drop-overlay")?.classList.add("hidden");
   });
-  chatPane.addEventListener("drop", (e) => {
+  chatPane.addEventListener("drop", async (e) => {
     e.preventDefault();
     chatPane.classList.remove("dragover");
+    document.getElementById("drop-overlay")?.classList.add("hidden");
     if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
       const paths = [];
       for (let i = 0; i < e.dataTransfer.files.length; i++) {
         const file = e.dataTransfer.files[i];
-        if (file.path) paths.push(file.path);
+        if (file.path) { paths.push(file.path); continue; }
+        if (file.type && file.type.startsWith("image/")) {
+          const dataUrl = await new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.onerror = () => reject(reader.error); reader.readAsDataURL(file); });
+          vscode.postMessage({ type: "addImageData", dataUrl, name: file.name });
+        } else {
+          const content = await file.text();
+          vscode.postMessage({ type: "addFileContent", name: file.name, content });
+        }
       }
       if (paths.length > 0) {
         vscode.postMessage({ type: "addFilesByPath", paths });
@@ -2418,6 +2468,9 @@
         testConnStatus.textContent = (msg.ok ? "✓ " : "✕ ") + msg.message;
         break;
       }
+      case "apiUsageResult":
+        renderApiUsage(msg);
+        break;
       case "testMcpServersResult": {
         if (!testMcpStatus) break;
         const allOk = msg.statuses.every((s) => s.ok);
@@ -2477,6 +2530,9 @@
   const testConnBtn = document.getElementById("test-conn-btn");
   const testConnStatus = document.getElementById("test-conn-status");
   const toggleKeyVisBtn = document.getElementById("toggle-key-visibility");
+  const refreshUsageBtn = document.getElementById("refresh-usage-btn");
+  const apiUsageContent = document.getElementById("api-usage-content");
+  const apiUsageKey = document.getElementById("api-usage-key");
 
   const cfgApiFormat = document.getElementById("cfg-api-format");
   const cfgBaseUrl = document.getElementById("cfg-base-url");
@@ -2495,6 +2551,8 @@
   const cfgAutoCompact = document.getElementById("cfg-auto-compact");
   const cfgDebugLogging = document.getElementById("cfg-debug-logging");
   const cfgMcpServers = document.getElementById("cfg-mcp-servers");
+  const cfgFigmaProxyEnabled = document.getElementById("cfg-figma-proxy-enabled");
+  const cfgFigmaProxyUrl = document.getElementById("cfg-figma-proxy-url");
   const figmaLoginBtn = document.getElementById("figma-login-btn");
   const figmaLogoutBtn = document.getElementById("figma-logout-btn");
   const figmaDesktopBtn = document.getElementById("figma-desktop-btn");
@@ -2508,6 +2566,57 @@
   const copyLogsBtn = document.getElementById("copy-logs-btn");
   const showLogsBtn = document.getElementById("show-logs-btn");
   let configuredSkills = [];
+
+  function usageNumber(value) {
+    return typeof value === "number" && Number.isFinite(value) ? new Intl.NumberFormat(currentLang === "fa" ? "fa-IR" : "en-US").format(value) : "—";
+  }
+  function usageDate(value) {
+    if (!value) return "—";
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString(currentLang === "fa" ? "fa-IR" : "en-US");
+  }
+  function addUsageMetric(parent, label, value) {
+    const item = document.createElement("div"); item.className = "api-usage-metric";
+    const title = document.createElement("span"); title.textContent = label;
+    const result = document.createElement("strong"); result.textContent = value;
+    item.append(title, result); parent.appendChild(item);
+  }
+  function renderApiUsage(msg) {
+    if (!apiUsageContent) return;
+    apiUsageContent.innerHTML = ""; apiUsageContent.className = "";
+    if (refreshUsageBtn) refreshUsageBtn.disabled = false;
+    if (!msg.ok || !msg.usage) {
+      apiUsageContent.className = "api-usage-error";
+      apiUsageContent.textContent = msg.message || "دریافت وضعیت مصرف ناموفق بود.";
+      return;
+    }
+    const u = msg.usage;
+    if (apiUsageKey) apiUsageKey.textContent = [u.key_name, u.key_masked].filter(Boolean).join(" · ");
+    const meta = document.createElement("div"); meta.className = "api-usage-meta";
+    [u.plan || "custom", u.status || "unknown", u.billing_mode || (u.managed === false ? "static" : "")].filter(Boolean).forEach((text) => {
+      const badge = document.createElement("span"); badge.textContent = text; meta.appendChild(badge);
+    });
+    apiUsageContent.appendChild(meta);
+    const metrics = document.createElement("div"); metrics.className = "api-usage-grid";
+    if (u.billing_mode === "daily_usage" || (u.daily_limit || 0) > 0) {
+      addUsageMetric(metrics, "مصرف امروز", usageNumber(u.used_today)); addUsageMetric(metrics, "باقی‌مانده امروز", usageNumber(u.remaining_today));
+      addUsageMetric(metrics, "سقف روزانه", usageNumber(u.daily_limit)); addUsageMetric(metrics, "درصد مصرف", typeof u.usage_percent === "number" ? `${u.usage_percent.toFixed(1)}٪` : "—");
+    } else {
+      addUsageMetric(metrics, "Context آخرین درخواست", usageNumber(u.context?.last_request_used)); addUsageMetric(metrics, "ظرفیت Context", usageNumber(u.context?.limit ?? u.context_limit));
+      addUsageMetric(metrics, "درصد Context", typeof u.context?.last_request_percent === "number" ? `${u.context.last_request_percent.toFixed(1)}٪` : "—"); addUsageMetric(metrics, "موجودی توکن", usageNumber(u.user_token_balance));
+    }
+    addUsageMetric(metrics, "کل درخواست‌ها", usageNumber(u.lifetime?.total_requests)); addUsageMetric(metrics, "کل توکن مصرفی", usageNumber(u.lifetime?.total_billable_tokens));
+    apiUsageContent.appendChild(metrics);
+    const details = document.createElement("div"); details.className = "api-usage-details";
+    const model = u.last_request?.model ? `مدل آخرین درخواست: ${u.last_request.model}` : "هنوز درخواستی ثبت نشده";
+    details.textContent = `${model} · زمان: ${usageDate(u.last_request?.created_at)}${u.expires_at ? ` · انقضای پلن: ${usageDate(u.expires_at)}` : ""}`;
+    apiUsageContent.appendChild(details);
+  }
+  function requestApiUsage() {
+    if (apiUsageContent) { apiUsageContent.className = "api-usage-loading"; apiUsageContent.textContent = "در حال دریافت وضعیت مصرف…"; }
+    if (refreshUsageBtn) refreshUsageBtn.disabled = true;
+    vscode.postMessage({ type: "requestApiUsage", tempSettings: { baseUrl: cfgBaseUrl ? cfgBaseUrl.value.trim() : "", apiKey: cfgApiKey ? cfgApiKey.value.trim() : "", apiFormat: cfgApiFormat ? cfgApiFormat.value : "anthropic" }});
+  }
 
   function updateFigmaStatusUI(auth, expiresAt, error) {
     if (!figmaAuthBadge) return;
@@ -2537,7 +2646,7 @@
     if (configuredSkills.length === 0) {
       const empty = document.createElement("div");
       empty.className = "skills-empty";
-      empty.textContent = "No skills added";
+      empty.textContent = translations[currentLang].no_skills;
       skillsList.appendChild(empty);
       return;
     }
@@ -2550,7 +2659,7 @@
       const remove = document.createElement("button");
       remove.type = "button";
       remove.className = "skill-remove-btn";
-      remove.title = "Remove skill";
+      remove.title = translations[currentLang].remove_skill;
       remove.textContent = "×";
       remove.addEventListener("click", () => {
         configuredSkills.splice(index, 1);
@@ -2604,6 +2713,8 @@
     renderSkills();
     if (cfgDebugLogging) cfgDebugLogging.checked = Boolean(s.debugLogging);
     if (cfgMcpServers) cfgMcpServers.value = s.mcpServers || "{}";
+    if (cfgFigmaProxyEnabled) cfgFigmaProxyEnabled.checked = Boolean(s.figmaProxyEnabled);
+    if (cfgFigmaProxyUrl) cfgFigmaProxyUrl.value = s.figmaProxyUrl || "";
     settingsModal.classList.remove("hidden");
   }
 
@@ -2666,6 +2777,8 @@
       });
     });
   }
+
+  if (refreshUsageBtn) refreshUsageBtn.addEventListener("click", requestApiUsage);
 
   if (figmaLoginBtn) {
     figmaLoginBtn.addEventListener("click", () => {
@@ -2745,6 +2858,8 @@
           experimentalAutoCompact: cfgAutoCompact ? cfgAutoCompact.checked : false,
           skills: configuredSkills,
           debugLogging: cfgDebugLogging ? cfgDebugLogging.checked : false,
+          figmaProxyEnabled: cfgFigmaProxyEnabled ? cfgFigmaProxyEnabled.checked : false,
+          figmaProxyUrl: cfgFigmaProxyUrl ? cfgFigmaProxyUrl.value.trim() : "",
           mcpServers: cfgMcpServers ? cfgMcpServers.value.trim() : "{}"
         }
       });

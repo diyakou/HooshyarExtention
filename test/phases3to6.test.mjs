@@ -83,7 +83,7 @@ test("Phases 3-6 integration units", async (t) => {
 
   await t.test("agent and ChangeSet tools are exposed through the registry definitions", () => {
     const names = buildToolDefinitions({ enableShellTool: false }).map((tool) => tool.name);
-    for (const name of ["get_related_files", "get_symbol_dependencies", "get_symbol_dependents", "create_plan", "delegate_search", "verify_changes", "apply_changeset"]) {
+    for (const name of ["get_related_files", "get_symbol_dependencies", "get_symbol_dependents", "create_plan", "delegate_search", "delegate_to_subagents", "verify_changes", "apply_changeset"]) {
       assert.ok(names.includes(name), `${name} should be registered`);
     }
   });

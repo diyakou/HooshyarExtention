@@ -14,6 +14,7 @@ import {
   matchesDepth,
   normalizeWorkspaceRelativePath,
   readTextFile,
+  readTextFileLineRange,
   resolveWorkspaceUri,
   isSubpath
 } from "./workspaceUtils";
@@ -46,11 +47,20 @@ import {
 } from "./codeIndex/codeGraphTools";
 import {
   createPlanTool,
+  delegateToSubAgentsTool,
   delegateSearchTool,
   getPlanTool,
   updatePlanStepTool,
   verifyChangesTool
 } from "./agent/agentTools";
+import {
+  getSymbolTool,
+  getFileOutlineTool,
+  findCallersTool,
+  findDependenciesTool,
+  getRelatedTestsTool,
+  getProjectMapTool
+} from "./intelligence";
 
 const DANGEROUS_COMMAND_PATTERNS = [
   /\brm\s+-rf\b/i,
@@ -70,8 +80,8 @@ export function buildToolDefinitions(opts: { enableShellTool: boolean; mcpTools?
     {
       name: "read_file",
       description:
-        "Read the text content of a file in the workspace. For large files or specific functions/handlers, " +
-        "specify start_line and end_line (1-indexed) to inspect that exact range. Path must be relative to the workspace root.",
+        "Read workspace file content. USE ONLY when full-file context is actually required. For large files or specific functions/handlers, " +
+        "prefer get_symbol or get_file_outline first, or specify start_line and end_line (1-indexed) to inspect that exact range. Path must be relative to the workspace root.",
       input_schema: {
         type: "object",
         properties: {
@@ -80,6 +90,78 @@ export function buildToolDefinitions(opts: { enableShellTool: boolean; mcpTools?
           end_line: { type: "number", description: "Optional 1-based end line number to stop reading at." }
         },
         required: ["path"]
+      }
+    },
+    {
+      name: "get_symbol",
+      description:
+        "Retrieve targeted symbol definition, its exact code range, callers, direct dependencies, and related tests without reading the full file. PREFER THIS over read_file when inspecting a specific function, method, class, or interface.",
+      input_schema: {
+        type: "object",
+        properties: {
+          symbol: { type: "string", description: "Symbol name (e.g. 'AuthService.login', 'TokenService', 'handleSubmit')" },
+          path: { type: "string", description: "Optional workspace-relative file path to locate the symbol directly" },
+          line: { type: "number", description: "Optional 1-based line number inside the file" }
+        }
+      }
+    },
+    {
+      name: "get_file_outline",
+      description:
+        "Retrieve the structural outline (all declared functions, classes, methods, interfaces, imports, and exports) for a file. PREFER THIS before reading a large file to locate target symbol ranges.",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Workspace-relative file path" }
+        },
+        required: ["path"]
+      }
+    },
+    {
+      name: "find_callers",
+      description: "Find all functions, methods, or locations that call/invoke the specified symbol.",
+      input_schema: {
+        type: "object",
+        properties: {
+          symbol: { type: "string", description: "Symbol name" },
+          path: { type: "string", description: "Workspace-relative file path" },
+          line: { type: "number", description: "One-based line number" },
+          character: { type: "number", description: "One-based character number" }
+        }
+      }
+    },
+    {
+      name: "find_dependencies",
+      description: "Find definitions and outgoing dependencies that the specified symbol or code location depends on.",
+      input_schema: {
+        type: "object",
+        properties: {
+          symbol: { type: "string", description: "Symbol name" },
+          path: { type: "string", description: "Workspace-relative file path" },
+          line: { type: "number", description: "One-based line number" },
+          character: { type: "number", description: "One-based character number" }
+        }
+      }
+    },
+    {
+      name: "get_related_tests",
+      description: "Find unit/integration test files and test suites directly associated with a workspace source file.",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Workspace-relative source file path (e.g. 'src/auth/AuthService.ts')" }
+        },
+        required: ["path"]
+      }
+    },
+    {
+      name: "get_project_map",
+      description: "Retrieve a compact project directory tree with symbol counts to understand workspace structure without broad searching.",
+      input_schema: {
+        type: "object",
+        properties: {
+          maxDepth: { type: "number", description: "Maximum directory depth (default 3)" }
+        }
       }
     },
     {
@@ -136,7 +218,7 @@ export function buildToolDefinitions(opts: { enableShellTool: boolean; mcpTools?
     },
     {
       name: "search_codebase",
-      description: "Grep-like search across the workspace.",
+      description: "Grep-like text search across workspace files. Use for INITIAL discovery when symbol name or file location is unknown. Do NOT repeatedly use it after the location or target file has been identified — use find_symbol, get_symbol, or read_file instead.",
       input_schema: {
         type: "object",
         properties: {
@@ -208,7 +290,7 @@ export function buildToolDefinitions(opts: { enableShellTool: boolean; mcpTools?
     },
     {
       name: "fetch_webpage",
-      description: "Fetch and read the text content of a web page, documentation URL, or GitHub resource over HTTP/HTTPS.",
+      description: "Fetch public web pages and documentation over HTTP/HTTPS. Never use this for Figma design/file links; private Figma content must be read with the connected mcp_figma_* tools.",
       input_schema: {
         type: "object",
         properties: {
@@ -283,6 +365,25 @@ export function buildToolDefinitions(opts: { enableShellTool: boolean; mcpTools?
       name: "delegate_search",
       description: "Search the indexed workspace using an isolated, project-aware search agent.",
       input_schema: { type: "object", properties: { query: { type: "string" }, scope: { type: "string" }, maxResults: { type: "number", minimum: 1, maximum: 50 } }, required: ["query"] }
+    },
+    {
+      name: "delegate_to_subagents",
+      description: "For large or cross-cutting tasks, run 1-4 isolated read-only specialist sub-agents concurrently and merge their evidence. Use once near the start instead of repeating broad searches. Sub-agents cannot edit files or run commands.",
+      input_schema: {
+        type: "object",
+        properties: {
+          goal: { type: "string", description: "The overall user goal." },
+          tasks: {
+            type: "array", minItems: 1, maxItems: 4,
+            items: { type: "object", properties: {
+              role: { type: "string", enum: ["architecture", "implementation", "tests", "security", "performance", "custom"] },
+              objective: { type: "string" }, scope: { type: "string", description: "Optional directory or file scope." }
+            }, required: ["role"] }
+          },
+          maxResultsPerAgent: { type: "number", minimum: 3, maximum: 15 }
+        },
+        required: ["goal", "tasks"]
+      }
     },
     {
       name: "verify_changes",
@@ -420,41 +521,40 @@ export async function readFileTool(input: {
   if (ignore.isIgnored(relPath)) {
     throw new Error(`Path is ignored by .gitignore/.cursorignore: ${relPath}`);
   }
-  const fullText = await readTextFile(uri);
-
   const rawStart = input.start_line ?? input.line_start ?? input.startLine;
   const rawEnd = input.end_line ?? input.line_end ?? input.endLine;
   const hasRange = rawStart !== undefined || rawEnd !== undefined;
 
-  const lines = fullText.split(/\r?\n/);
-  const totalLines = lines.length;
+  const result = await readTextFileLineRange(
+    uri,
+    typeof rawStart === "number" ? rawStart : undefined,
+    typeof rawEnd === "number" ? rawEnd : undefined
+  );
 
   if (hasRange) {
-    const start = Math.max(1, typeof rawStart === "number" ? Math.floor(rawStart) : 1);
-    const end = Math.min(totalLines, typeof rawEnd === "number" ? Math.max(start, Math.floor(rawEnd)) : totalLines);
-
-    if (start > totalLines) {
-      return `File '${relPath}' has ${totalLines} lines. Requested start_line ${start} is beyond end of file.`;
+    if (result.start > result.totalLines && result.totalLines > 0) {
+      return `File '${relPath}' has ${result.totalLines} lines. Requested start_line ${result.start} is beyond end of file.`;
     }
-    const selected = lines.slice(start - 1, end);
+    const truncatedNote = result.isTruncated
+      ? `\n\n[Range capped at ${result.lines.length} lines (${result.start} to ${result.end} of ${result.totalLines}). To read further, request starting at line ${result.end + 1}.]`
+      : "";
     return (
-      `=== File: ${relPath} (Lines ${start} to ${end} of ${totalLines}) ===\n` +
-      selected.join("\n")
+      `=== File: ${relPath} (Lines ${result.start} to ${result.end} of ${result.totalLines}) ===\n` +
+      result.lines.join("\n") +
+      truncatedNote
     );
   }
 
   // If no range specified and file is large (> 400 lines), return first 350 lines with pagination instructions
-  const MAX_DEFAULT_LINES = 400;
-  if (totalLines > MAX_DEFAULT_LINES) {
-    const selected = lines.slice(0, 350);
+  if (result.isTruncated) {
     return (
-      `=== File: ${relPath} (Showing lines 1 to 350 of ${totalLines}) ===\n` +
-      selected.join("\n") +
-      `\n\n[File truncated: showing lines 1-350 of ${totalLines}. To read subsequent sections or specific handlers, call read_file with start_line and end_line, e.g. {"path": "${relPath}", "start_line": 351, "end_line": ${Math.min(700, totalLines)}}]`
+      `=== File: ${relPath} (Showing lines 1 to ${result.lines.length} of ${result.totalLines}) ===\n` +
+      result.lines.join("\n") +
+      `\n\n[File truncated: showing lines 1-${result.lines.length} of ${result.totalLines}. To read subsequent sections or specific handlers, call read_file with start_line and end_line, e.g. {"path": "${relPath}", "start_line": ${result.lines.length + 1}, "end_line": ${Math.min(result.lines.length + 350, result.totalLines)}}]`
     );
   }
 
-  return fullText;
+  return result.lines.join("\n");
 }
 
 export async function writeFileTool(input: { path?: unknown; content?: unknown }): Promise<string> {
@@ -469,7 +569,7 @@ export async function writeFileTool(input: { path?: unknown; content?: unknown }
       ? input.content
       : String(input.content);
 
-  const maxWrite = vscode.workspace.getConfiguration("hooshyar").get<number>("maxWriteSizeBytes", 2_000_000);
+  const maxWrite = vscode.workspace.getConfiguration("hooshyar").get<number>("maxWriteSizeBytes", 10_485_760);
   if (Buffer.byteLength(content, "utf-8") > maxWrite) {
     throw new Error(`Content exceeds max write size (${maxWrite} bytes).`);
   }
@@ -685,7 +785,7 @@ export async function searchReplaceTool(input: {
   if (typeof input.new_string !== "string") throw new Error("search_replace requires 'new_string'.");
 
   const { uri } = resolveWorkspaceUri(filePath);
-  const rawText = await readTextFile(uri);
+  const rawText = await readTextFile(uri, 50_000_000);
 
   const { updatedText, count } = applySearchReplace(rawText, input.old_string, input.new_string, Boolean(input.replace_all));
 
@@ -847,7 +947,7 @@ export async function searchCodebaseTool(
 
       let text: string;
       try {
-        text = await readTextFile(uri);
+        text = await readTextFile(uri, 10_000_000);
       } catch {
         continue;
       }
@@ -1381,6 +1481,17 @@ export async function fetchWebpageTool(input: { url?: string }, signal?: AbortSi
   if (!urlStr || (!urlStr.startsWith("http://") && !urlStr.startsWith("https://"))) {
     throw new Error("fetch_webpage requires a valid HTTP or HTTPS 'url'.");
   }
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(urlStr);
+  } catch {
+    throw new Error("fetch_webpage requires a valid HTTP or HTTPS 'url'.");
+  }
+  if (/(^|\.)figma\.com$/i.test(parsedUrl.hostname)) {
+    throw new Error(
+      "این لینک یک فایل خصوصی Figma است و با fetch_webpage قابل خواندن نیست. از ابزار متصل mcp_figma_* (مانند get_design_context یا get_metadata) با fileKey و nodeId استخراج‌شده از لینک استفاده کنید. اگر ابزار Figma در دسترس نیست، اتصال MCP را در تنظیمات تست کنید."
+    );
+  }
 
   const response = await fetch(urlStr, {
     headers: {
@@ -1478,6 +1589,18 @@ export async function executeTool(
       return getWorkspaceSymbolsTool(input as any);
     case "find_symbol":
       return findSymbolTool(input as any);
+    case "get_symbol":
+      return getSymbolTool(input as any);
+    case "get_file_outline":
+      return getFileOutlineTool(input as any);
+    case "find_callers":
+      return findCallersTool(input as any);
+    case "find_dependencies":
+      return findDependenciesTool(input as any);
+    case "get_related_tests":
+      return getRelatedTestsTool(input as any);
+    case "get_project_map":
+      return getProjectMapTool(input as any);
     case "find_definition":
       return findDefinitionTool(input as any);
     case "find_references":
@@ -1508,6 +1631,8 @@ export async function executeTool(
       return updatePlanStepTool(input as any);
     case "delegate_search":
       return delegateSearchTool(input as any);
+    case "delegate_to_subagents":
+      return delegateToSubAgentsTool(input as any);
     case "verify_changes":
       return verifyChangesTool(input as any);
     case "semantic_search": {
@@ -1565,6 +1690,7 @@ export function isParallelSafeTool(name: string): boolean {
     name === "search_codebase" ||
     name === "semantic_search" ||
     name === "delegate_search" ||
+    name === "delegate_to_subagents" ||
     name === "get_plan" ||
     name === "get_workspace_symbols" ||
     name === "find_symbol" ||

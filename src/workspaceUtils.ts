@@ -1,5 +1,7 @@
 import * as vscode from "vscode";
 import * as path from "path";
+import * as fs from "fs";
+import * as readline from "readline";
 
 export const DEFAULT_EXCLUDE_GLOB =
   "**/{node_modules,out,dist,build,.git,.venv,venv,__pycache__,.next,.turbo,coverage}/**";
@@ -313,20 +315,157 @@ export function isBinaryBuffer(buf: Buffer): boolean {
 }
 
 export function getMaxFileBytes(): number {
-  return vscode.workspace.getConfiguration("hooshyar").get<number>("maxFileSizeBytes", 2_000_000);
+  return vscode.workspace.getConfiguration("hooshyar").get<number>("maxFileSizeBytes", 10_485_760);
 }
 
 export async function readTextFile(uri: vscode.Uri, maxBytes?: number): Promise<string> {
-  const limit = maxBytes ?? getMaxFileBytes();
+  const limit = maxBytes !== undefined ? maxBytes : getMaxFileBytes();
   const stat = await vscode.workspace.fs.stat(uri);
-  if (stat.size > limit) {
-    throw new Error(`File exceeds max size (${stat.size} > ${limit} bytes).`);
+  if (limit > 0 && isFinite(limit) && stat.size > limit) {
+    throw new Error(`File exceeds max size (${stat.size} > ${limit} bytes). For large files, use 'read_file' with 'start_line' and 'end_line' to read specific sections.`);
   }
   const bytes = await vscode.workspace.fs.readFile(uri);
   if (isBinaryBuffer(Buffer.from(bytes))) {
     throw new Error("Refusing to read binary file as text.");
   }
   return Buffer.from(bytes).toString("utf-8");
+}
+
+export interface FileRangeResult {
+  lines: string[];
+  start: number;
+  end: number;
+  totalLines: number;
+  isTruncated: boolean;
+}
+
+export async function readTextFileLineRange(
+  uri: vscode.Uri,
+  startLine?: number,
+  endLine?: number,
+  maxReturnLines: number = 1000
+): Promise<FileRangeResult> {
+  const hasRange = startLine !== undefined || endLine !== undefined;
+  const reqStart = startLine !== undefined ? Math.max(1, Math.floor(startLine)) : 1;
+  let reqEnd = endLine !== undefined ? Math.max(reqStart, Math.floor(endLine)) : undefined;
+
+  let isTruncated = false;
+  if (hasRange && reqEnd !== undefined) {
+    const requestedCount = reqEnd - reqStart + 1;
+    if (requestedCount > maxReturnLines) {
+      reqEnd = reqStart + maxReturnLines - 1;
+      isTruncated = true;
+    }
+  }
+
+  // 1. Try fast streaming via fs if local file
+  if (uri.scheme === "file" && uri.fsPath) {
+    try {
+      if (fs.existsSync(uri.fsPath)) {
+        const stat = await fs.promises.stat(uri.fsPath);
+        // Check binary on first 8KB
+        const fd = await fs.promises.open(uri.fsPath, "r");
+        try {
+          const sample = Buffer.alloc(Math.min(8192, stat.size));
+          if (sample.length > 0) {
+            await fd.read(sample, 0, sample.length, 0);
+            if (isBinaryBuffer(sample)) {
+              throw new Error("Refusing to read binary file as text.");
+            }
+          }
+        } finally {
+          await fd.close();
+        }
+
+        const fileStream = fs.createReadStream(uri.fsPath, { encoding: "utf-8" });
+        const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
+
+        const selected: string[] = [];
+        let currentLine = 0;
+        const targetEnd = reqEnd ?? (hasRange ? reqStart + maxReturnLines - 1 : 350);
+
+        for await (const line of rl) {
+          currentLine++;
+          if (currentLine >= reqStart && currentLine <= targetEnd) {
+            selected.push(line);
+          }
+          // If file is very large (> 20MB) and we passed targetEnd, terminate stream early to save time
+          if (stat.size > 20_000_000 && currentLine > targetEnd) {
+            fileStream.destroy();
+            break;
+          }
+        }
+
+        const totalLines = currentLine;
+        const actualEnd = reqEnd !== undefined
+          ? Math.min(reqEnd, totalLines)
+          : (hasRange ? Math.min(targetEnd, totalLines) : Math.min(350, totalLines));
+
+        if (!hasRange && totalLines > 400) {
+          isTruncated = true;
+        }
+
+        return {
+          lines: selected,
+          start: reqStart,
+          end: actualEnd,
+          totalLines,
+          isTruncated
+        };
+      }
+    } catch (err: unknown) {
+      if ((err as Error)?.message?.includes("Refusing to read binary")) {
+        throw err;
+      }
+      // If fs streaming failed for any reason (e.g. mock fs or permissions), fall through to vscode fs
+    }
+  }
+
+  // 2. Fallback via vscode.workspace.fs (virtual filesystem, memory fs in tests, etc.)
+  const bytes = await vscode.workspace.fs.readFile(uri);
+  const buf = Buffer.from(bytes);
+  if (isBinaryBuffer(buf)) {
+    throw new Error("Refusing to read binary file as text.");
+  }
+  const text = buf.toString("utf-8");
+  const allLines = text.split(/\r?\n/);
+  const totalLines = allLines.length;
+
+  if (hasRange) {
+    const end = reqEnd !== undefined ? Math.min(reqEnd, totalLines) : Math.min(reqStart + maxReturnLines - 1, totalLines);
+    if (reqStart > totalLines && totalLines > 0) {
+      return { lines: [], start: reqStart, end, totalLines, isTruncated: false };
+    }
+    const selected = allLines.slice(reqStart - 1, end);
+    return {
+      lines: selected,
+      start: reqStart,
+      end,
+      totalLines,
+      isTruncated
+    };
+  }
+
+  // No range specified
+  const MAX_DEFAULT_LINES = 400;
+  if (totalLines > MAX_DEFAULT_LINES) {
+    const selected = allLines.slice(0, 350);
+    return {
+      lines: selected,
+      start: 1,
+      end: 350,
+      totalLines,
+      isTruncated: true
+    };
+  }
+
+  return {
+    lines: allLines,
+    start: 1,
+    end: totalLines,
+    totalLines,
+    isTruncated: false
+  };
 }
 
 export function listAllWorkspaceRoots(): string {
